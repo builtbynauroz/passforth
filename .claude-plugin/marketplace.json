@@ -1,0 +1,16 @@
+{
+  "name": "passforth",
+  "owner": {
+    "name": "builtbynauroz"
+  },
+  "metadata": {
+    "description": "Passforth's Claude Code plugin: end-to-end encrypted hand-offs between Claude Code sessions."
+  },
+  "plugins": [
+    {
+      "name": "passforth",
+      "source": "./",
+      "description": "Hand tasks between Claude Code sessions, end to end encrypted and held until the developer receiving them says yes."
+    }
+  ]
+}
