@@ -39,7 +39,7 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = "1.14.1"
+VERSION = "1.15.0"
 HOME = os.environ.get("PASSFORTH_HOME") or os.path.join(os.path.expanduser("~"), ".passforth")
 PBKDF2_ITERATIONS = 600_000
 MAX_TEXT_BYTES = 16_384
@@ -1752,8 +1752,9 @@ def tool_login(_: dict) -> str:
         key = own_key()
         if key and key.get("userId") == answer["userId"]:
             return f"Linked as @{answer['handle']}, ready to send and receive."
-        return (f"Linked as @{answer['handle']}. One step left, in a terminal: python3 {HERE} unlock. It "
-                "asks for your passphrase, which never leaves this machine.")
+        return (f"Linked as @{answer['handle']}. One step left: python3 {HERE} unlock puts your key on this machine. "
+                "It can run from this session: with no terminal it asks for your passphrase in a window on your "
+                "screen, never in this chat.")
     grant = device_start(url)
     write_json("device.json", {"deviceCode": grant["deviceCode"], "userCode": grant["userCode"],
                                "uri": grant["verificationUri"], "expiresAt": time.time() + int(grant["expiresIn"])})
@@ -1774,8 +1775,9 @@ def tool_status(_: dict) -> str:
         lines.append(f"Your key (version {key['version']}) is on this machine; its fingerprint is "
                      f"{fingerprint(key['publicBytes'])}.")
     else:
-        lines.append(f"No key on this machine yet: run python3 {HERE} unlock in a terminal. It asks for "
-                     "your passphrase.")
+        lines.append(f"No key on this machine yet: python3 {HERE} unlock puts it here. It can run from this "
+                     "session: with no terminal it asks for your passphrase in a window on your screen, never in this "
+                     "chat.")
     return "\n".join(lines)
 
 
@@ -2110,6 +2112,154 @@ def reply_json(value: dict) -> None:
 # Commands a person runs in their own terminal.
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The terminal (ADR-0018; design/DECISIONS.md, "Numbered steps"). A command prints numbered steps, every line under a step
+# carries one mark, and color and the spinner show only on a terminal that wants them. With no terminal to ask at, as in
+# Claude Code's and Codex's shells, a command takes the agent's path: nothing waits on a prompt, a passphrase is asked in a
+# window on the developer's screen and never passes through the agent, and a step that waits on its developer stops the
+# run with "Not finished", exit status 75, naming what to do before the same command runs again.
+
+
+class NotFinished(Exception):
+    pass
+
+
+class NoScreen(Exception):
+    pass
+
+
+NOT_FINISHED = 75
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+AGENT_WAIT_S = 90
+WINDOW_WAIT_S = 120
+_indent = "  "
+
+
+def styled(stream=None) -> bool:
+    stream = stream or sys.stdout
+    return stream.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def paint(text: str, code: str, stream=None) -> str:
+    return f"\033[{code}m{text}\033[0m" if styled(stream) else text
+
+
+def mark(kind: str, stream=None) -> str:
+    symbol, code = {"ok": ("✓", "32"), "note": ("!", "33"), "fail": ("✗", "31")}[kind]
+    if os.environ.get("TERM") == "linux":  # the Linux console's font has no ✓ or ✗
+        symbol = {"✓": "+", "✗": "x"}.get(symbol, symbol)
+    return paint(symbol, code, stream)
+
+
+def header(action: str) -> None:
+    global _indent
+    _indent = "  "
+    print(f"{paint('Passforth ' + VERSION, '1')} · {action}")
+    print(paint(f"client sha256 {client_digest()}", "2"))
+    print(flush=True)
+
+
+def step(number: int, title: str, total: int = 3) -> None:
+    global _indent
+    _indent = " " * 5
+    if number > 1:
+        print()
+    print(f"{paint(f'{number}/{total}', '1;32')}  {paint(title, '1')}", flush=True)
+
+
+def say(text: str, kind: str = "") -> None:
+    print(f"{_indent}{mark(kind) + ' ' if kind else ''}{text}", flush=True)
+
+
+def finish(text: str, kind: str = "ok") -> None:
+    global _indent
+    _indent = "  "
+    print(f"\n{mark(kind)} {text}", flush=True)
+
+
+def fail(text: str) -> None:
+    # Red with its mark on a terminal; elsewhere the plain "passforth: …" line that scripts and agents read.
+    if styled(sys.stderr):
+        print(f"{mark('fail', sys.stderr)} {text}", file=sys.stderr)
+    else:
+        print(f"passforth: {text}", file=sys.stderr)
+
+
+def tilde(where: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + where[len(home):] if where == home or where.startswith(home + os.sep) else where
+
+
+def tool_line(name: str, where: str) -> str:
+    return f"{name.ljust(11)}  {tilde(where)}"
+
+
+def has_terminal() -> bool:
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0)))
+        return True
+    except OSError:
+        return False
+
+
+def open_browser(page: str) -> bool:
+    # On this machine's screen, for its developer; never without a screen, or with $PASSFORTH_NO_BROWSER set.
+    if os.environ.get("PASSFORTH_NO_BROWSER"):
+        return False
+    if sys.platform == "darwin":
+        command = ["open", page]
+    elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        command = ["xdg-open", page]
+    else:
+        return False
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+# macOS's own dialog with its answer hidden. It gives up after WINDOW_WAIT_S, so no run waits on a window nobody answers.
+WINDOW_SCRIPT = """on run argv
+  set answer to display dialog (item 1 of argv) default answer "" with hidden answer with title "Passforth" buttons {"Cancel", "OK"} default button "OK" giving up after ((item 2 of argv) as integer)
+  if gave up of answer then error number -128
+  return text returned of answer
+end run"""
+
+
+def ask_window(text: str) -> str:
+    # A passphrase typed into a window on the developer's screen, never through the agent that ran the command: macOS's
+    # dialog, or zenity or kdialog on a Linux desktop. $PASSFORTH_ASKPASS names another program that prints the answer,
+    # as $SSH_ASKPASS does for ssh.
+    program = os.environ.get("PASSFORTH_ASKPASS")
+    screen = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if program:
+        command = [program, text]
+    elif sys.platform == "darwin":
+        command = ["osascript", "-e", WINDOW_SCRIPT, text, str(WINDOW_WAIT_S)]
+    elif screen and shutil.which("zenity"):
+        command = ["zenity", "--entry", "--hide-text", "--title=Passforth", f"--text={text}", f"--timeout={WINDOW_WAIT_S}"]
+    elif screen and shutil.which("kdialog"):
+        command = ["kdialog", "--title", "Passforth", "--password", text]
+    else:
+        raise NoScreen()
+    try:
+        ran = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=WINDOW_WAIT_S + 15)
+    except OSError:
+        raise NoScreen()
+    except subprocess.TimeoutExpired:
+        ran = None
+    if ran is None or ran.returncode != 0:
+        raise NotFinished("the passphrase window closed without an answer. Run the same command again to open it again.")
+    return ran.stdout.removesuffix("\n")
+
+
+def ask_passphrase(prompt: str, window: str, terminal: bool) -> str:
+    return getpass.getpass(f"{_indent}{prompt}") if terminal else ask_window(window)
+
+
 def tty_input(prompt: str, hidden: bool = False) -> str:
     if hidden:
         return getpass.getpass(prompt)
@@ -2119,7 +2269,10 @@ def tty_input(prompt: str, hidden: bool = False) -> str:
             sys.stderr.flush()
             return tty.readline().strip()
     except OSError:
-        return input(prompt)
+        try:
+            return input(prompt)
+        except EOFError:
+            raise SystemExit("passforth: this asks you to type an answer, so run it in a terminal.")
 
 
 def claude_dirs() -> list:
@@ -2149,9 +2302,20 @@ def hook_command(event: str) -> str:
 def ours(group: dict) -> bool:
     return any(
         "/huddle/hook.sh" in str(h.get("command", ""))
-        or re.search(r"passforth\.(py|mjs)\b.* hook ", str(h.get("command", ""))) is not None  # either client's (ADR-0016)
+        or re.search(r"passforth\.(py|mjs)\b.* hook ", " ".join([str(h.get("command", "")), *map(str, h.get("args") or [])]) + " ")
+        is not None  # either client's, as one line or in exec form (ADR-0016, ADR-0017)
         for h in group.get("hooks", [])
     )
+
+
+# Claude Code accounts whose MCP server connect couldn't add itself (no claude on PATH, or its add failed): connect
+# prints mcp_hint for each.
+MCP_BY_HAND: list = []
+
+
+def mcp_hint(directory: str) -> str:
+    return (f"Add the MCP server yourself: CLAUDE_CONFIG_DIR={directory} claude mcp add -s user passforth "
+            f"-e PASSFORTH_ACCOUNT={account_label(directory)} -- python3 {path('passforth.py')} mcp")
 
 
 def plugin_enabled(settings: dict) -> bool:
@@ -2208,18 +2372,20 @@ def configure(directory: str, add: bool) -> bool:
     claude = shutil.which("claude")
     if not claude:
         if add:
-            print(f"  add the MCP server yourself: CLAUDE_CONFIG_DIR={directory} claude mcp add -s user passforth "
-                  f"-e PASSFORTH_ACCOUNT={account_label(directory)} -- python3 {path('passforth.py')} mcp", file=sys.stderr)
+            MCP_BY_HAND.append(directory)
         return add
     env_vars = dict(os.environ, CLAUDE_CONFIG_DIR=directory)
     subprocess.run([claude, "mcp", "remove", "passforth", "-s", "user"], env=env_vars, capture_output=True)
     if add:
-        subprocess.run(
-            [claude, "mcp", "add", "-s", "user", "-e", f"PASSFORTH_ACCOUNT={account_label(directory)}", "passforth", "--",
+        # The name before -e, which takes every value up to the next option: after it, the name was taken for one.
+        added = subprocess.run(
+            [claude, "mcp", "add", "-s", "user", "passforth", "-e", f"PASSFORTH_ACCOUNT={account_label(directory)}", "--",
              "python3", "-B", path("passforth.py"), "mcp"],
             env=env_vars,
             capture_output=True,
         )
+        if added.returncode != 0:
+            MCP_BY_HAND.append(directory)
     return add
 
 
@@ -2375,23 +2541,78 @@ def device_collect(url: str, device_code: str) -> dict:
     return answer
 
 
-def link_by_code(url: str) -> str:
-    # The terminal's way: show the code, wait while its developer approves it, take the new machine's secret.
-    grant = device_start(url)
-    print(f"To link this machine, open {grant['verificationUri']} and type the code {grant['userCode']}.")
-    print(f"It runs out in {int(grant['expiresIn']) // 60} minutes. Waiting…")
-    deadline = time.time() + int(grant["expiresIn"]) + 60
-    while time.time() < deadline:
-        time.sleep(max(1, int(grant.get("interval") or 5)))
+def link_by_code(url: str, terminal: bool) -> str:
+    # The code waits in device.json (shared with /passforth:login), so a run that stops for its developer's approval
+    # carries on with the same code next time. A terminal's run waits for the approval at once; an agent's run stops
+    # first, so the agent can tell its developer, and its next run waits.
+    pending = read_json("device.json")
+    fresh = not (pending and float(pending.get("expiresAt", 0)) > time.time() + 30)
+    if fresh:
+        grant = device_start(url)
+        pending = {"deviceCode": grant["deviceCode"], "userCode": grant["userCode"], "uri": grant["verificationUri"],
+                   "expiresAt": time.time() + int(grant["expiresIn"]), "interval": int(grant.get("interval") or 5)}
+        write_json("device.json", pending)
+    page = f"{pending['uri']}?code={pending['userCode']}"
+    say(f"{paint('Open', '2')}  {paint(page, '1')}")
+    say(f"{paint('Code', '2')}  {paint(str(pending['userCode']), '1')}")
+    if fresh and open_browser(page):
+        say(paint("Opened it in your browser.", "2"))
+    if fresh and not terminal:
+        raise NotFinished("ask the user to approve this machine at that page, signing in if asked, then run the same "
+                          "command again.")
+    return wait_for_approval(url, pending, page, terminal)
+
+
+def wait_for_approval(url: str, pending: dict, page: str, terminal: bool) -> str:
+    # A terminal waits the code's whole life, a spinner turning; an agent's run waits AGENT_WAIT_S, then stops again.
+    expires = float(pending["expiresAt"])
+    deadline = expires if terminal else min(expires, time.time() + AGENT_WAIT_S)
+    interval = max(1, int(pending.get("interval") or 5))
+    who = "you" if terminal else "the user"
+    spinning = styled()
+    frames = "|/-\\" if os.environ.get("TERM") == "linux" else SPIN
+    if not spinning:
+        say(f"Waiting for {who} to approve it…")
+    polled = 0.0
+    frame = 0
+    try:
+        if spinning:
+            sys.stdout.write("\033[?25l")
+        while time.time() < deadline:
+            if spinning:
+                left = max(0, int(expires - time.time()))
+                sys.stdout.write(f"\r\033[2K{_indent}{paint(frames[frame % len(frames)], '32')} Waiting for {who} to "
+                                 f"approve it {paint(f'· {left // 60}:{left % 60:02d} left', '2')}")
+                sys.stdout.flush()
+                frame += 1
+            if time.time() - polled >= interval:
+                polled = time.time()
+                try:
+                    answer = device_collect(url, str(pending["deviceCode"]))
+                except RelayError as error:
+                    if error.status != 0:
+                        # Denied, expired or used: the code is dead, so the next run starts a new one.
+                        try:
+                            os.remove(path("device.json"))
+                        except FileNotFoundError:
+                            pass
+                        raise SystemExit(f"passforth: {error}")
+                    answer = {}
+                if answer.get("status") == "approved":
+                    os.remove(path("device.json"))
+                    return str(answer["secret"])
+            time.sleep(0.08 if spinning else 0.5)
+    finally:
+        if spinning:
+            sys.stdout.write("\r\033[2K\033[?25h")
+            sys.stdout.flush()
+    if time.time() >= expires:
         try:
-            answer = device_collect(url, grant["deviceCode"])
-        except RelayError as error:
-            if error.status == 0:
-                continue
-            raise SystemExit(f"passforth: {error}")
-        if answer.get("status") == "approved":
-            return str(answer["secret"])
-    raise SystemExit("passforth: the code ran out before it was approved; run connect again.")
+            os.remove(path("device.json"))
+        except FileNotFoundError:
+            pass
+        raise SystemExit("passforth: the code ran out before it was approved; run connect again.")
+    raise NotFinished(f"the user hasn't approved it yet. Ask them to open {page}, then run the same command again.")
 
 
 def logout_now() -> str:
@@ -2496,7 +2717,8 @@ def command_login(argv: list) -> int:
 
 
 def command_logout(_: list) -> int:
-    print(logout_now())
+    header("log out")
+    say(logout_now(), "ok")
     return 0
 
 
@@ -2507,65 +2729,119 @@ def command_connect(argv: list) -> int:
     url = (url or config().get("url") or "").rstrip("/")
     if not url.startswith("https://") and not url.startswith("http://localhost") and not url.startswith("http://127.0.0.1"):
         raise SystemExit("passforth: connect needs --url https://…")
-    print(f"passforth {VERSION} · client sha256 {client_digest()}")
-    token = "" if "--code" in argv else getpass.getpass(
-        "Paste this machine's secret from the Passforth dashboard, or press Enter to link it with a code instead (it "
-        "won't show): ").strip()
-    if not token:
-        token = link_by_code(url)
-    if not token.startswith("hk_live_"):
-        raise SystemExit("passforth: that isn't a machine secret; make one on the dashboard's Machines page.")
-    _, me = relay("GET", "me", token=token, url=url)
-    print(f"Connecting this machine as @{me['handle']} ({me['machineLabel']}).")
-    write_private("secret", token + "\n")
-    write_json("config.json", {"url": url, "userId": me["userId"], "handle": me["handle"], "accounts": []})
-    unlock_or_create(token, url, me)
+    terminal = has_terminal()
+    header("connect this machine")
+    step(1, "Link this machine")
+    token, me = linked_already(url)
+    if me:
+        say(f"Already linked as {paint('@' + me['handle'], '1')} ({me['machineLabel']})", "ok")
+    else:
+        token = "" if "--code" in argv or not terminal else getpass.getpass(
+            f"{_indent}Paste this machine's secret, or press Enter for a code (it won't show): ").strip()
+        if not token:
+            token = link_by_code(url, terminal)
+        if not token.startswith("hk_live_"):
+            raise SystemExit("passforth: that isn't a machine secret; make one on the dashboard's Machines page.")
+        # Kept the moment it arrives: a code's secret is handed over once, so a run that stops after the approval (a
+        # slow /me, say) carries on with this link next time instead of asking for another.
+        write_private("secret", token + "\n")
+        write_json("config.json", {"url": url, "accounts": []})
+        _, me = relay("GET", "me", token=token, url=url)
+        write_json("config.json", {"url": url, "userId": me["userId"], "handle": me["handle"], "accounts": []})
+        say(f"Linked as {paint('@' + me['handle'], '1')} ({me['machineLabel']})", "ok")
+    stored = stored_key(token, url)
+    step(2, "Unlock your key" if stored else "Choose your passphrase")
+    unlocked = unlock_or_create(token, url, me, terminal, stored)
+    step(3, "Connect your AI tools")
     accounts = []
     for directory in claude_dirs():
         if configure(directory, add=True):
             accounts.append(directory)
-            print(f"  connected Claude Code at {directory} (account \"{account_label(directory)}\")")
+            say(f"{tool_line('Claude Code', directory)} ({account_label(directory)})", "ok")
+            if directory in MCP_BY_HAND:
+                say(mcp_hint(directory), "note")
         else:
-            print(f"  Claude Code at {directory} runs Passforth from its plugin, which brings the hooks and the server")
+            say(f"{tool_line('Claude Code', directory)} ({account_label(directory)}), through its Passforth plugin", "ok")
     homes = [home for home in codex_homes() if configure_codex(home, add=True)]
     for home in homes:
-        print(f"  connected Codex at {home} (account \"{codex_label(home)}\")")
+        say(f"{tool_line('Codex', home)} ({codex_label(home)})", "ok")
     cfg = config()
     cfg["accounts"] = accounts
     cfg["codexHomes"] = homes
     write_json("config.json", cfg)
-    key = own_key()
-    print(f"Your key's fingerprint: {fingerprint(key['publicBytes'])}")
     if homes:
-        print("In Codex, open /hooks once and trust Passforth's hooks: Codex runs them only after that.")
-    print("Start or restart Claude Code or Codex in a trusted folder to join. To remove Passforth from this machine:")
-    print(f"  python3 {HERE} disconnect")
+        say("In Codex, open /hooks once and trust Passforth's hooks: Codex runs them only after that.", "note")
+    if not unlocked:
+        finish("Connected, but the key is still locked: run the unlock command above in a terminal on this machine, "
+               "then restart Claude Code or Codex.", "note")
+        return NOT_FINISHED
+    finish("Connected. " + ("Restart Claude Code or Codex to join." if terminal
+                            else "Ask the user to restart Claude Code or Codex to join."))
+    say(paint(f"Remove it: python3 {HERE} disconnect", "2"))
     return 0
 
 
-def unlock_or_create(token: str, url: str, me: dict) -> None:
+def linked_already(url: str) -> tuple:
+    # A machine this relay already knows keeps its link, so connect runs again (an agent's next run, or after an
+    # update) without linking a second machine.
+    if config().get("url") != url or not os.path.exists(path("secret")):
+        return "", None
+    try:
+        _, me = relay("GET", "me", timeout=10)
+    except RelayError as error:
+        if error.status == 401:
+            return "", None
+        raise
+    return secret(), me
+
+
+def stored_key(token: str, url: str) -> dict | None:
     try:
         _, stored = relay("GET", "keys/me", token=token, url=url)
     except RelayError as error:
         if error.status != 404:
             raise
-        stored = None
-    if stored:
-        for _ in range(3):
-            passphrase = getpass.getpass("Your Passforth passphrase: ")
-            try:
-                private = unwrap_private(stored["wrap"], passphrase, me["userId"])
-            except ValueError:
-                print("That passphrase doesn't open your key. Try again.", file=sys.stderr)
-                continue
-            if b64(x25519_public(private)) != stored["publicKey"]:
-                raise SystemExit("passforth: the stored key doesn't match its public half; contact support.")
-            save_key(me, int(stored["version"]), private)
-            return
-        raise SystemExit(f"passforth: forgot it? python3 {HERE} reset-key makes a new one.")
-    print("Choose a Passforth passphrase. It locks your key: Passforth never sees it and can't recover it.")
-    private = secrets.token_bytes(32)
-    passphrase = new_passphrase()
+        return None
+    return stored or None
+
+
+def unlock_or_create(token: str, url: str, me: dict, terminal: bool, stored: dict | None) -> bool:
+    # True once the key is on this machine. False when there's neither a terminal nor a screen to ask on: its developer
+    # runs unlock in a terminal later.
+    key = own_key()
+    if stored and key and key.get("userId") == me["userId"] and key.get("public") == stored["publicKey"]:
+        say(f"Your key is already on this machine · {fingerprint(key['publicBytes'])}", "ok")
+        return True
+    if not stored:
+        say("It locks your key. Passforth never sees it and can't recover it.")
+    if not terminal:
+        say("Asking the user in a window on their screen: the passphrase never passes through here.")
+    try:
+        if stored:
+            for attempt in range(3):
+                passphrase = ask_passphrase(
+                    "Your Passforth passphrase: ",
+                    ("That passphrase doesn't open your key. " if attempt else "")
+                    + "Type your Passforth passphrase to unlock your key on this machine.",
+                    terminal,
+                )
+                try:
+                    private = unwrap_private(stored["wrap"], passphrase, me["userId"])
+                except ValueError:
+                    say("That passphrase doesn't open your key. Try again.", "note")
+                    continue
+                if b64(x25519_public(private)) != stored["publicKey"]:
+                    raise SystemExit("passforth: the stored key doesn't match its public half; contact support.")
+                save_key(me, int(stored["version"]), private)
+                say(f"Key unlocked · {fingerprint(x25519_public(private))}", "ok")
+                return True
+            raise SystemExit(f"passforth: forgot it? python3 {HERE} reset-key makes a new one.")
+        private = secrets.token_bytes(32)
+        passphrase = new_passphrase(terminal)
+    except NoScreen:
+        say("No screen here to ask for the passphrase. Run this in a terminal on this machine:", "note")
+        say(f"  python3 {HERE} unlock")
+        return False
     _, saved = relay(
         "PUT",
         "keys/me",
@@ -2574,17 +2850,26 @@ def unlock_or_create(token: str, url: str, me: dict) -> None:
         url=url,
     )
     save_key(me, int(saved["version"]), private)
+    say(f"Key locked · {fingerprint(x25519_public(private))}", "ok")
+    return True
 
 
-def new_passphrase() -> str:
+def new_passphrase(terminal: bool) -> str:
+    warning = ""
     while True:
-        first = getpass.getpass("New passphrase (12 characters or more): ")
+        first = ask_passphrase(
+            "Passphrase (12 characters or more): ",
+            warning + "Choose a Passforth passphrase of 12 characters or more. It locks your key: Passforth never sees "
+            "it and can't recover it.",
+            terminal,
+        )
         if len(first) < 12:
-            print("Use 12 characters or more.", file=sys.stderr)
-            continue
-        if getpass.getpass("Again: ") == first:
+            warning = "Use 12 characters or more. "
+        elif ask_passphrase("Again: ", "Type the same passphrase again.", terminal) == first:
             return first
-        print("They didn't match.", file=sys.stderr)
+        else:
+            warning = "They didn't match. "
+        say(warning.strip(), "note")
 
 
 def save_key(me: dict, version: int, private: bytes) -> None:
@@ -2596,26 +2881,28 @@ def save_key(me: dict, version: int, private: bytes) -> None:
 
 
 def command_unlock(_: list) -> int:
+    header("unlock your key")
     _, me = relay("GET", "me")
-    unlock_or_create(secret(), config()["url"], me)
-    print(f"Unlocked. Fingerprint: {fingerprint(own_key()['publicBytes'])}")
-    return 0
+    token, url = secret(), config()["url"]
+    return 0 if unlock_or_create(token, url, me, has_terminal(), stored_key(token, url)) else NOT_FINISHED
 
 
 def command_reset_key(_: list) -> int:
-    print("This makes a new key. Messages sealed to your old one can't be opened again; your contacts are told your key changed.")
-    if tty_input("Type reset to go on: ") != "reset":
+    header("make a new key")
+    say("This makes a new key. Messages sealed to your old one can't be opened again; your contacts are told your key "
+        "changed.", "note")
+    if tty_input(f"{_indent}Type reset to go on: ") != "reset":
         return 1
     _, me = relay("GET", "me")
     private = secrets.token_bytes(32)
-    passphrase = new_passphrase()
+    passphrase = new_passphrase(True)
     _, saved = relay(
         "PUT",
         "keys/me",
         {"publicKey": b64(x25519_public(private)), "wrap": wrap_private(private, passphrase, me["userId"]), "reset": True},
     )
     save_key(me, int(saved["version"]), private)
-    print(f"New key. Fingerprint: {fingerprint(x25519_public(private))}. Run unlock on your other machines.")
+    say(f"New key · {fingerprint(x25519_public(private))}. Run unlock on your other machines.", "ok")
     return 0
 
 
@@ -2623,51 +2910,56 @@ def command_trust(argv: list) -> int:
     if not argv:
         raise SystemExit("passforth: trust @handle")
     handle = argv[0].lstrip("@").lower()
+    header("trust a key")
     _, found = relay("GET", "keys/" + urllib.parse.quote(handle))
     public = unb64(found["publicKey"], 32)
-    print(f"@{handle}'s key fingerprint: {fingerprint(public)}")
-    print("Check it with them over a channel you trust before you accept it.")
-    if tty_input("Trust this key? Type yes: ") != "yes":
+    say(f"@{handle}'s key fingerprint: {paint(fingerprint(public), '1')}")
+    say("Check it with them over a channel you trust before you accept it.", "note")
+    if tty_input(f"{_indent}Trust this key? Type yes: ") != "yes":
         return 1
     peers = read_json("peers.json", {}) or {}
     peers[found["userId"]] = {"handle": found["handle"], "version": int(found["version"]), "public": found["publicKey"]}
     write_json("peers.json", peers)
-    print("Trusted.")
+    say("Trusted.", "ok")
     return 0
 
 
 def command_disconnect(_: list) -> int:
+    header("disconnect this machine")
     try:
         relay("POST", "machine/revoke", {})
-        print("This machine's secret is revoked.")
+        say("This machine's secret is revoked.", "ok")
     except RelayError as error:
-        print(f"passforth: couldn't revoke the secret ({error}); revoke it on the dashboard's Machines page.", file=sys.stderr)
+        say(f"Couldn't revoke the secret ({error}); revoke it on the dashboard's Machines page.", "note")
     for directory in config().get("accounts") or claude_dirs():
         configure(directory, add=False)
-        print(f"  removed Passforth from {directory}")
+        say(f"Removed from Claude Code at {tilde(directory)}", "ok")
     for home in config().get("codexHomes") or codex_homes():
         if configure_codex(home, add=False):
-            print(f"  removed Passforth from {home}")
+            say(f"Removed from Codex at {tilde(home)}", "ok")
     for name in ("secret", "key.json", "peers.json", "config.json"):
         try:
             os.remove(path(name))
         except FileNotFoundError:
             pass
     shutil.rmtree(path("state"), ignore_errors=True)
-    print("Passforth is removed from this machine. The previous settings are in settings.json.before-passforth.")
+    finish("Passforth is removed from this machine. Your previous settings are in settings.json.before-passforth.")
     return 0
 
 
 def command_status(_: list) -> int:
     cfg = config()
     key = own_key()
-    print(f"passforth {VERSION} · client sha256 {client_digest()}")
-    print(f"relay: {cfg.get('url', 'not connected')} · you: @{cfg.get('handle', '?')}")
-    print(f"key fingerprint: {fingerprint(key['publicBytes']) if key else 'no key'}")
-    for directory in cfg.get("accounts") or []:
-        print(f"  Claude Code account: {directory}")
-    for home in cfg.get("codexHomes") or []:
-        print(f"  Codex account: {home}")
+    header("status")
+    rows = [
+        ("You", "@" + cfg["handle"] if cfg.get("handle") else "not connected"),
+        ("Relay", cfg.get("url") or "not connected"),
+        ("Key", fingerprint(key["publicBytes"]) if key else f"none on this machine yet: python3 {HERE} unlock"),
+    ]
+    rows += [("Claude Code", tilde(directory)) for directory in cfg.get("accounts") or []]
+    rows += [("Codex", tilde(home)) for home in cfg.get("codexHomes") or []]
+    for label, value in rows:
+        say(f"{paint(label.ljust(11), '2')}  {value}")
     return 0
 
 
@@ -2709,9 +3001,17 @@ def main(argv: list) -> int:
         return 2
     try:
         return command(argv[1:])
+    except NotFinished as error:
+        say(f"Not finished: {error}", "note")
+        return NOT_FINISHED
     except RelayError as error:
-        print(f"passforth: {error}", file=sys.stderr)
+        fail(str(error))
         return 1
+    except SystemExit as error:
+        if isinstance(error.code, str):
+            fail(error.code.removeprefix("passforth: "))
+            return 1
+        raise
     except KeyboardInterrupt:
         return 130
 

@@ -1,6 +1,6 @@
 {
   "name": "passforth",
-  "version": "1.14.1",
+  "version": "1.15.0",
   "displayName": "Passforth",
   "description": "Hand tasks, questions and notes between Claude Code sessions, yours and your teammates', end to end encrypted and held until the developer receiving them says yes.",
   "author": {

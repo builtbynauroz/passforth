@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Passforth: end-to-end encrypted messages between Claude Code and Codex sessions (docs/backend/adr/0009, 0014). One
 // file, Node 18+ or Bun 1.1+ and their built-ins only, MIT licence. A port of passforth.py (client 1.13.0), so either
-// client reads what the other writes under ~/.passforth. Connect installs it as ~/.passforth/passforth.mjs (npx
-// passforth connect does that from npm's cache), and the Claude Code plugin (ADR-0015) carries it in its own folder:
+// client reads what the other writes under ~/.passforth; unlike it, this one runs on Windows too (ADR-0017). Connect
+// installs it as ~/.passforth/passforth.mjs (npx @builtbynauroz/passforth connect does that from npm's cache):
 //   node passforth.mjs connect [--url URL]  set up this machine: asks for its secret and your passphrase
 //   node passforth.mjs unlock               unlock your key again after you reset it on another machine
 //   node passforth.mjs reset-key            forgot your passphrase: a new key (messages sealed to the old one are lost)
@@ -14,7 +14,7 @@
 // Message text and refs are sealed on this machine and opened only on the receiver's. The relay keeps routing data
 // (who, to whom, kind, size, times, state) and the sealed bytes; it never sees your passphrase or your private key.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   createCipheriv,
   createDecipheriv,
@@ -49,12 +49,29 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { relative, resolve } from "node:path";
+import {
+  basename,
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { createInterface } from "node:readline";
 import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 import { deflateRawSync } from "node:zlib";
 
-export const VERSION = "1.14.1";
+export const VERSION = "1.15.0";
+// Windows' own behaviour (ADR-0017): exec-form hooks, no POSIX tools, double-quoted commands. PASSFORTH_PLATFORM is
+// there only so tests can drive those paths on macOS and Linux.
+export const WINDOWS =
+  (process.env.PASSFORTH_PLATFORM || process.platform) === "win32";
+// Paths follow the real file system, which no variable changes: "\\" separates them on Windows, where node:path's
+// win32 functions do the work; elsewhere Python's posixpath, so both clients agree byte for byte.
+const NATIVE = sep === "\\";
 const HOME = process.env.PASSFORTH_HOME || pjoin(homedir(), ".passforth");
 const PBKDF2_ITERATIONS = 600_000;
 const MAX_TEXT_BYTES = 16_384;
@@ -290,11 +307,13 @@ const shq = (text) =>
 function pjoin(first, ...rest) {
   let out = first;
   for (const part of rest) {
-    out = part.startsWith("/")
-      ? part
-      : !out || out.endsWith("/")
-        ? out + part
-        : `${out}/${part}`;
+    if (NATIVE) out = isAbsolute(part) ? resolve(out, part) : join(out, part);
+    else
+      out = part.startsWith("/")
+        ? part
+        : !out || out.endsWith("/")
+          ? out + part
+          : `${out}/${part}`;
   }
   return out;
 }
@@ -304,16 +323,19 @@ function psplit(p) {
   if (head && head !== "/".repeat(head.length)) head = head.replace(/\/+$/, "");
   return [head, p.slice(i)];
 }
-const pbase = (p) => p.slice(p.lastIndexOf("/") + 1);
-const pdir = (p) => psplit(p)[0];
+const pbase = (p) => (NATIVE ? basename(p) : p.slice(p.lastIndexOf("/") + 1));
+const pdir = (p) => (NATIVE ? dirname(p) : psplit(p)[0]);
+const samePath = (a, b) =>
+  NATIVE ? a.toLowerCase() === b.toLowerCase() : a === b;
 const expanduser = (p) =>
-  p === "~" || p.startsWith("~/")
-    ? homedir().replace(/\/+$/, "") + p.slice(1)
+  p === "~" || p.startsWith("~/") || (NATIVE && p.startsWith("~\\"))
+    ? homedir().replace(NATIVE ? /[\\/]+$/ : /\/+$/, "") + p.slice(1)
     : p;
 
 // os.path.realpath: symlinks resolved as far as the path exists, the rest kept as written, ".." after a link taken
 // from where the link points (node:fs resolves ".." first, which can land elsewhere).
 function realpath(p) {
+  if (NATIVE) return realpathNative(p);
   const seen = new Map();
   const walk = (start, rest) => {
     let current = start;
@@ -364,6 +386,23 @@ function realpath(p) {
   return resolve(walk("", p)[0]);
 }
 
+function realpathNative(p) {
+  // Windows takes ".." before any link, so resolve() first; then the longest part that exists, as the system names it
+  // (links and junctions followed), and the rest as written.
+  let head = resolve(p);
+  const tail = [];
+  for (;;) {
+    try {
+      return join(realpathSync.native(head), ...tail);
+    } catch {
+      const parent = dirname(head);
+      if (parent === head) return resolve(p);
+      tail.unshift(basename(head));
+      head = parent;
+    }
+  }
+}
+
 // os.path.commonpath of two absolute paths.
 function commonpath(a, b) {
   const x = a.split("/").filter((c) => c && c !== ".");
@@ -371,6 +410,15 @@ function commonpath(a, b) {
   let i = 0;
   while (i < x.length && i < y.length && x[i] === y[i]) i++;
   return `/${x.slice(0, i).join("/")}`;
+}
+
+// commonpath([root, p]) == root: p is root or inside it. Windows compares as its file system does, ignoring case.
+function within(root, p) {
+  if (!NATIVE) return commonpath(root, p) === root;
+  const rel = relative(root, p);
+  return (
+    !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+  );
 }
 
 const stat = (p, follow = true) => {
@@ -405,17 +453,26 @@ function removeTree(p) {
   }
 }
 
-// shutil.which.
+// shutil.which, with PATHEXT's extensions on Windows.
 function which(command) {
-  const found = process.env.PATH ?? "/usr/bin:/bin";
+  const found = process.env.PATH ?? (NATIVE ? "" : "/usr/bin:/bin");
   if (!found) return null;
-  for (const dir of new Set(found.split(":"))) {
-    const name = pjoin(dir, command);
-    try {
-      accessSync(name, constants.X_OK);
-      if (!statSync(name).isDirectory()) return name;
-    } catch {
-      // not here
+  const names =
+    NATIVE && !/\.[^.\\/]+$/.test(command)
+      ? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+          .split(";")
+          .filter(Boolean)
+          .map((ext) => command + ext.toLowerCase())
+      : [command];
+  for (const dir of new Set(found.split(delimiter))) {
+    for (const name of names) {
+      const full = pjoin(dir, name);
+      try {
+        accessSync(full, constants.X_OK);
+        if (!statSync(full).isDirectory()) return full;
+      } catch {
+        // not here
+      }
     }
   }
   return null;
@@ -871,8 +928,12 @@ const path = (...parts) => pjoin(HOME, ...parts);
 // This client, wherever it runs from: ~/.passforth/passforth.mjs after connect, an npx cache, or a plugin's own folder,
 // so a command it tells someone to type points at a file that exists. Connect points it at the copy it installs.
 const THIS = realpathSync(fileURLToPath(import.meta.url));
-let HERE = shq(THIS);
+// Windows' shells (CMD, PowerShell) take a path in double quotes; elsewhere it's shell-quoted.
+const quoteHere = (p) => (WINDOWS ? `"${p}"` : shq(p));
+let HERE = quoteHere(THIS);
 const RUNTIME = process.versions.bun ? "bun" : "node";
+// A command to type in a terminal: how to run this client, then what to run.
+export const hereCommand = (args) => `${RUNTIME} ${HERE} ${args}`;
 
 function readJson(name, fallback = null) {
   try {
@@ -891,7 +952,26 @@ function writePrivate(name, content) {
   const tmp = `${target}.tmp`;
   writeFileSync(tmp, content, { mode: 0o600 });
   chmodSync(tmp, 0o600);
-  renameSync(tmp, target);
+  replaceFile(tmp, target);
+}
+
+// os.replace. On Windows a file another process holds (an editor, a scanner) can refuse it for a moment: up to 10 more
+// tries, 50 ms apart.
+function replaceFile(tmp, target) {
+  for (let tries = 0; ; tries++) {
+    try {
+      renameSync(tmp, target);
+      return;
+    } catch (error) {
+      if (
+        !WINDOWS ||
+        tries === 10 ||
+        !["EPERM", "EBUSY", "EACCES"].includes(error.code)
+      )
+        throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
 }
 
 const writeJson = (name, value) =>
@@ -1035,7 +1115,7 @@ function peerKey(userId, handle, version, publicB64) {
       409,
       "key_changed",
       `@${handle}'s key changed (now ${fingerprint(publicRaw)}). If they reset their passphrase, check the ` +
-        `fingerprint with them, then run in your own terminal: ${RUNTIME} ${HERE} trust @${handle}`,
+        `fingerprint with them, then run in your own terminal: ${hereCommand(`trust @${handle}`)}`,
     );
   }
   if (
@@ -1066,7 +1146,7 @@ function requireKey() {
     throw new RelayError(
       0,
       "no_key",
-      `This machine has no Passforth key; in a terminal, run: ${RUNTIME} ${HERE} unlock`,
+      `This machine has no Passforth key; in a terminal, run: ${hereCommand("unlock")}`,
     );
   }
   return key;
@@ -1096,6 +1176,11 @@ function parentOf(pid) {
 }
 
 function rememberSession(sid, shortId) {
+  // On Windows connect's hooks run with no shell, so a hook's parent is Claude Code itself, and there's no ps to ask.
+  if (WINDOWS) {
+    writeJson(pjoin("state", `pid-${process.ppid}.json`), { sid, shortId });
+    return;
+  }
   let pid = process.ppid;
   for (let seen = 0; pid > 1 && seen < 4; seen++) {
     writeJson(pjoin("state", `pid-${pid}.json`), { sid, shortId });
@@ -1412,7 +1497,7 @@ function pickFiles(paths, root) {
   let total = 0;
   for (const given of paths) {
     const full = realpath(pjoin(root, given));
-    if (full === root || commonpath(root, full) !== root) {
+    if (full === root || !within(root, full)) {
       throw new RelayError(
         422,
         "outside_project",
@@ -1573,7 +1658,7 @@ export function zipFolder(folderPath, given) {
         if (entry.name.startsWith(".")) continue;
         const inner = pjoin(dir, entry.name);
         if (entry.isDirectory()) walk(inner);
-        else listed.push(relative(full, inner));
+        else listed.push(relative(full, inner).replaceAll(sep, "/"));
       }
     };
     walk(full);
@@ -1583,11 +1668,7 @@ export function zipFolder(folderPath, given) {
   let raw = 0;
   for (const name of [...new Set(listed)].sort(byCodePoint)) {
     const inner = pjoin(full, name);
-    if (
-      isLink(inner) ||
-      !isFile(inner) ||
-      commonpath(full, realpath(inner)) !== full
-    )
+    if (isLink(inner) || !isFile(inner) || !within(full, realpath(inner)))
       continue;
     const info = statSync(inner);
     raw += info.size;
@@ -2272,7 +2353,8 @@ function wakeCodex(sid, text, notices) {
         "This line is Passforth's, not your user's.",
     );
   }
-  const codex = which("codex");
+  // No codex queue on Windows, where connect doesn't set Codex up (ADR-0017).
+  const codex = WINDOWS ? null : which("codex");
   if (codex && lines.length) {
     spawnSync(
       codex,
@@ -3011,8 +3093,9 @@ async function toolLogin() {
     if (key && key.userId === answer.userId)
       return `Linked as @${answer.handle}, ready to send and receive.`;
     return (
-      `Linked as @${answer.handle}. One step left, in a terminal: ${RUNTIME} ${HERE} unlock. It asks for your ` +
-      "passphrase, which never leaves this machine."
+      `Linked as @${answer.handle}. One step left: ${hereCommand("unlock")} puts your key on this machine. ` +
+      "It can run from this session: with no terminal it asks for your passphrase in a window on your " +
+      "screen, never in this chat."
     );
   }
   const grant = await deviceStart(url);
@@ -3049,10 +3132,19 @@ async function toolStatus() {
     );
   } else {
     lines.push(
-      `No key on this machine yet: run ${RUNTIME} ${HERE} unlock in a terminal. It asks for your passphrase.`,
+      `No key on this machine yet: ${hereCommand("unlock")} puts it here. It can run from this session: with no ` +
+        "terminal it asks for your passphrase in a window on your screen, never in this chat.",
     );
   }
   return lines.join("\n");
+}
+
+// Windows reads some names as devices (CON, NUL, COM1) and "a:b" as a stream: a sender's name it can save as a file.
+function windowsName(name) {
+  const clean = name.replace(/[<>:"|?*]/g, "_").replace(/[. ]+$/, "") || "file";
+  return /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(clean)
+    ? `_${clean}`
+    : clean;
 }
 
 async function toolFiles(args) {
@@ -3070,11 +3162,12 @@ async function toolFiles(args) {
   const lines = [];
   const names = new Set();
   for (const f of files) {
-    let name = f.name;
+    const given = WINDOWS ? windowsName(f.name) : f.name;
+    let name = given;
     let n = 2;
-    const [stem, dot, ext] = rpartition(f.name, ".");
+    const [stem, dot, ext] = rpartition(given, ".");
     while (names.has(name)) {
-      name = dot && stem ? `${stem} (${n})${dot}${ext}` : `${f.name} (${n})`;
+      name = dot && stem ? `${stem} (${n})${dot}${ext}` : `${given} (${n})`;
       n += 1;
     }
     names.add(name);
@@ -3153,7 +3246,7 @@ async function toolSearch(args) {
     throw new RelayError(422, "validation", "query is 1 to 200 characters.");
   }
   if (!archiveOn())
-    return `Search is off on this machine; ${RUNTIME} ${HERE} archive on turns it on.`;
+    return `Search is off on this machine; ${hereCommand("archive on")} turns it on.`;
   const terms = query.split(" ");
   const found = new Map();
   let content;
@@ -3552,6 +3645,231 @@ const replyJson = (value) => out(`${dumps(value)}\n`);
 // ---------------------------------------------------------------------------------------------------------------------
 // Commands a person runs in their own terminal.
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The terminal (ADR-0018; design/DECISIONS.md, "Numbered steps"). A command prints numbered steps, every line under a step
+// carries one mark, and color and the spinner show only on a terminal that wants them. With no terminal to ask at, as in
+// Claude Code's and Codex's shells, a command takes the agent's path: nothing waits on a prompt, a passphrase is asked in a
+// window on the developer's screen and never passes through the agent, and a step that waits on its developer stops the
+// run with "Not finished", exit status 75, naming what to do before the same command runs again.
+
+class NotFinished extends Error {}
+class NoScreen extends Error {}
+
+const NOT_FINISHED = 75;
+const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+const AGENT_WAIT_S = 90;
+const WINDOW_WAIT_S = 120;
+let indent = "  ";
+
+const styled = (fd = 1) =>
+  isatty(fd) && !process.env.NO_COLOR && process.env.TERM !== "dumb";
+
+const paint = (text, code, fd = 1) =>
+  styled(fd) ? `\x1b[${code}m${text}\x1b[0m` : text;
+
+// The Linux console's font has no ✓, ✗ or braille; on Windows, only the consoles below draw them.
+function drawsUnicode() {
+  const env = process.env;
+  if (!WINDOWS) return env.TERM !== "linux";
+  return (
+    Boolean(env.WT_SESSION) ||
+    env.TERM_PROGRAM === "vscode" ||
+    env.ConEmuANSI === "ON" ||
+    ["xterm-256color", "alacritty"].includes(env.TERM)
+  );
+}
+
+// Each mark, what stands in for it where the console can't draw it, and its color.
+const MARKS = {
+  ok: ["✓", WINDOWS ? "√" : "+", "32"],
+  note: ["!", "!", "33"],
+  fail: ["✗", WINDOWS ? "×" : "x", "31"],
+};
+
+function mark(kind, fd = 1) {
+  const [symbol, plain, code] = MARKS[kind];
+  return paint(drawsUnicode() ? symbol : plain, code, fd);
+}
+
+function header(action) {
+  indent = "  ";
+  print(`${paint(`Passforth ${VERSION}`, "1")} · ${action}`);
+  print(paint(`client sha256 ${clientDigest()}`, "2"));
+  print("");
+}
+
+function step(number, title, total = 3) {
+  indent = " ".repeat(5);
+  if (number > 1) print("");
+  print(`${paint(`${number}/${total}`, "1;32")}  ${paint(title, "1")}`);
+}
+
+const say = (text, kind = "") =>
+  print(`${indent}${kind ? `${mark(kind)} ` : ""}${text}`);
+
+function finish(text, kind = "ok") {
+  indent = "  ";
+  print(`\n${mark(kind)} ${text}`);
+}
+
+// Red with its mark on a terminal; elsewhere the plain "passforth: …" line that scripts and agents read.
+const fail = (text) =>
+  eprint(styled(2) ? `${mark("fail", 2)} ${text}` : `passforth: ${text}`);
+
+function tilde(where) {
+  const home = expanduser("~");
+  return where === home || where.startsWith(home + sep)
+    ? `~${where.slice(home.length)}`
+    : where;
+}
+
+const toolLine = (name, where) => `${name.padEnd(11)}  ${tilde(where)}`;
+
+function hasTerminal() {
+  // Windows has no /dev/tty: its console is stdin, as getpass reads it.
+  if (WINDOWS) return Boolean(process.stdin.isTTY);
+  try {
+    closeSync(openSync("/dev/tty", "r+"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function openBrowser(page) {
+  // On this machine's screen, for its developer; never without a screen, or with $PASSFORTH_NO_BROWSER set.
+  if (process.env.PASSFORTH_NO_BROWSER) return false;
+  const command = WINDOWS
+    ? ["rundll32.exe", "url.dll,FileProtocolHandler", page]
+    : process.platform === "darwin"
+      ? ["open", page]
+      : process.env.DISPLAY || process.env.WAYLAND_DISPLAY
+        ? ["xdg-open", page]
+        : null;
+  // Python's Popen fails at once on a missing program; spawn only says so later, as an event.
+  if (!command || !which(command[0])) return false;
+  try {
+    spawn(command[0], command.slice(1), { stdio: "ignore", detached: true })
+      .on("error", () => {})
+      .unref();
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+// macOS's own dialog with its answer hidden. It gives up after WINDOW_WAIT_S, so no run waits on a window nobody answers.
+const WINDOW_SCRIPT = `on run argv
+  set answer to display dialog (item 1 of argv) default answer "" with hidden answer with title "Passforth" buttons {"Cancel", "OK"} default button "OK" giving up after ((item 2 of argv) as integer)
+  if gave up of answer then error number -128
+  return text returned of answer
+end run`;
+
+// Windows' own: a WinForms password box in PowerShell, on top and centred, that closes itself after WINDOW_WAIT_S. Its
+// text comes in $env:PASSFORTH_WINDOW_TEXT, never written into the script, and its answer goes out as UTF-8.
+const POWERSHELL_WINDOW = [
+  "$ErrorActionPreference = 'Stop'",
+  "Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+  "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false",
+  "[System.Windows.Forms.Application]::EnableVisualStyles()",
+  "$form = New-Object System.Windows.Forms.Form",
+  "$form.Text = 'Passforth'",
+  "$form.TopMost = $true",
+  "$form.StartPosition = 'CenterScreen'",
+  "$form.FormBorderStyle = 'FixedDialog'",
+  "$form.MaximizeBox = $false",
+  "$form.MinimizeBox = $false",
+  "$label = New-Object System.Windows.Forms.Label",
+  "$label.Text = $env:PASSFORTH_WINDOW_TEXT",
+  "$label.Location = New-Object System.Drawing.Point 12, 12",
+  "$label.Size = $label.GetPreferredSize((New-Object System.Drawing.Size 360, 0))",
+  "$box = New-Object System.Windows.Forms.TextBox",
+  "$box.UseSystemPasswordChar = $true",
+  "$box.SetBounds(12, $label.Bottom + 10, 360, 24)",
+  "$ok = New-Object System.Windows.Forms.Button",
+  "$ok.Text = 'OK'",
+  "$ok.DialogResult = 'OK'",
+  "$ok.SetBounds(216, $box.Bottom + 12, 75, 26)",
+  "$cancel = New-Object System.Windows.Forms.Button",
+  "$cancel.Text = 'Cancel'",
+  "$cancel.DialogResult = 'Cancel'",
+  "$cancel.SetBounds(297, $box.Bottom + 12, 75, 26)",
+  "$form.AcceptButton = $ok",
+  "$form.CancelButton = $cancel",
+  "$form.ClientSize = New-Object System.Drawing.Size 384, ($ok.Bottom + 12)",
+  "$form.Controls.AddRange(@($label, $box, $ok, $cancel))",
+  "$timer = New-Object System.Windows.Forms.Timer",
+  `$timer.Interval = ${WINDOW_WAIT_S * 1000}`,
+  "$timer.add_Tick({ $form.Close() })",
+  "$form.add_Shown({ $form.Activate(); [void]$box.Focus(); $timer.Start() })",
+  "if ($form.ShowDialog() -ne 'OK') { exit 1 }",
+  "[Console]::Out.Write($box.Text)",
+  "exit 0",
+].join("\n");
+
+// The window that asks, as [program, args, spawn options]; null where there's no screen to show one on.
+export function windowCommand(text) {
+  const program = process.env.PASSFORTH_ASKPASS;
+  const screen = process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
+  if (program) return viaCmd(program, [text]);
+  if (WINDOWS) {
+    // No windowsHide: its SW_HIDE would apply to the box, the first window PowerShell shows.
+    const script = Buffer.from(POWERSHELL_WINDOW, "utf16le").toString("base64");
+    return [
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", script],
+      { env: { ...process.env, PASSFORTH_WINDOW_TEXT: text } },
+    ];
+  }
+  if (process.platform === "darwin")
+    return [
+      "osascript",
+      ["-e", WINDOW_SCRIPT, text, String(WINDOW_WAIT_S)],
+      {},
+    ];
+  if (screen && which("zenity"))
+    return [
+      "zenity",
+      [
+        "--entry",
+        "--hide-text",
+        "--title=Passforth",
+        `--text=${text}`,
+        `--timeout=${WINDOW_WAIT_S}`,
+      ],
+      {},
+    ];
+  if (screen && which("kdialog"))
+    return ["kdialog", ["--title", "Passforth", "--password", text], {}];
+  return null;
+}
+
+function askWindow(text) {
+  // A passphrase typed into a window on the developer's screen, never through the agent that ran the command: macOS's
+  // dialog, Windows' WinForms box, or zenity or kdialog on a Linux desktop. $PASSFORTH_ASKPASS names another program
+  // that prints the answer, as $SSH_ASKPASS does for ssh.
+  const command = windowCommand(text);
+  if (!command) throw new NoScreen();
+  const [program, args, options] = command;
+  const ran = spawnSync(program, args, {
+    ...options,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    timeout: (WINDOW_WAIT_S + 15) * 1000,
+  });
+  if (ran.error && ran.error.code !== "ETIMEDOUT") throw new NoScreen();
+  if (ran.error || ran.status !== 0) {
+    throw new NotFinished(
+      "the passphrase window closed without an answer. Run the same command again to open it again.",
+    );
+  }
+  // Read as Python's text mode reads it, without the one newline it ends with.
+  return ran.stdout.replace(/\r\n?/g, "\n").replace(/\n$/, "");
+}
+
+const askPassphrase = (prompt, window, terminal) =>
+  terminal ? getpass(`${indent}${prompt}`) : askWindow(window);
+
 // A line typed at a file descriptor, without its newline; null at its end.
 function fdLine(fd) {
   const got = [];
@@ -3571,11 +3889,60 @@ function fdLine(fd) {
   }
 }
 
-// input(): a line from stdin, or EOFError.
+// input(): a line from stdin, or EOFError. Windows ends one with "\r\n", which Python's text mode reads as "\n".
 function stdinLine() {
   const line = fdLine(0);
   if (line === null) throw new EOFError("EOF when reading a line");
-  return line;
+  return WINDOWS ? line.replace(/\r$/, "") : line;
+}
+
+// Windows' console has no /dev/tty or stty: a hidden line is read in raw mode, as Python's win_getpass reads it (Enter
+// ends it, Backspace takes a character back, Ctrl+C leaves with 130), and the console's mode is put back.
+function consoleHidden(prompt) {
+  return new Promise((done) => {
+    const stdin = process.stdin;
+    let line = "";
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "\u0003") {
+          stdin.setRawMode(false);
+          process.exit(130);
+        }
+        if (ch === "\r" || ch === "\n") {
+          stdin.removeListener("data", onData);
+          stdin.setRawMode(false);
+          stdin.pause();
+          process.stderr.write("\n");
+          done(line);
+          return;
+        }
+        line =
+          ch === "\b" || ch === "\u007f"
+            ? Array.from(line).slice(0, -1).join("")
+            : line + ch;
+      }
+    };
+    process.stderr.write(prompt);
+    stdin.setEncoding("utf8");
+    stdin.setRawMode(true);
+    stdin.on("data", onData);
+    stdin.resume();
+  });
+}
+
+// A visible line typed at Windows' console, readline doing the echo and the editing.
+function consoleLine(prompt) {
+  return new Promise((done) => {
+    const reader = createInterface({
+      input: process.stdin,
+      output: process.stderr,
+    });
+    reader.on("SIGINT", () => process.exit(130));
+    reader.question(prompt, (answer) => {
+      reader.close();
+      done(answer);
+    });
+  });
 }
 
 // The terminal's echo goes off for the line, and comes back on even after a Ctrl-C.
@@ -3586,6 +3953,7 @@ const HIDDEN_READ =
 function getpass(prompt) {
   // getpass.getpass: read at the terminal with its echo off, never from stdin, which send may use for the message.
   // With no terminal at all, Python falls back to stdin with a warning, and so does this.
+  if (WINDOWS && process.stdin.isTTY) return consoleHidden(prompt);
   let tty;
   try {
     tty = openSync("/dev/tty", "r+");
@@ -3611,12 +3979,20 @@ function getpass(prompt) {
 }
 
 function ttyInput(prompt) {
+  if (WINDOWS && process.stdin.isTTY) return consoleLine(prompt).then(strip);
   let tty;
   try {
     tty = openSync("/dev/tty", "r");
   } catch {
     writeSync(1, prompt);
-    return stdinLine();
+    try {
+      return stdinLine();
+    } catch (error) {
+      if (!(error instanceof EOFError)) throw error;
+      throw new SystemExit(
+        "passforth: this asks you to type an answer, so run it in a terminal.",
+      );
+    }
   }
   try {
     writeSync(2, prompt);
@@ -3636,7 +4012,7 @@ function claudeDirs() {
     if (
       (name === ".claude" || name.startsWith(".claude-")) &&
       isDir(full) &&
-      !found.includes(full)
+      !found.some((other) => samePath(other, full))
     )
       found.push(full);
   }
@@ -3658,15 +4034,78 @@ const runner = () => (process.versions.bun && !which("node") ? "bun" : "node");
 const hookCommand = (event) =>
   `${runner()} ${shq(path("passforth.mjs"))} hook ${event}`;
 
-function ours(group) {
-  // Passforth's entries from either client (passforth.py or passforth.mjs), so each connect replaces the other's.
+// Claude Code accounts whose MCP server connect couldn't add itself (no claude on PATH, or its add failed): connect
+// prints mcpHint for each.
+const MCP_BY_HAND = [];
+
+export function mcpHint(directory) {
+  const label = accountLabel(directory);
+  return WINDOWS
+    ? `Add the MCP server yourself: $env:CLAUDE_CONFIG_DIR="${directory}"; claude mcp add -s user passforth ` +
+        `-e PASSFORTH_ACCOUNT=${label} -- ${runner()} "${path("passforth.mjs")}" mcp`
+    : `Add the MCP server yourself: CLAUDE_CONFIG_DIR=${directory} claude mcp add -s user passforth ` +
+        `-e PASSFORTH_ACCOUNT=${label} -- ${runner()} ${path("passforth.mjs")} mcp`;
+}
+
+export function ours(group) {
+  // Passforth's entries from either client (passforth.py or passforth.mjs), as one line or in exec form, whose command
+  // and args read as one line: each connect replaces the other's, and disconnect finds them all.
   return (get(group, "hooks", []) ?? []).some((h) => {
     const command = str(get(h, "command", ""));
+    const args = orElse(get(h, "args", null), []);
+    const line = [command, ...(Array.isArray(args) ? args.map(str) : [])].join(
+      " ",
+    );
     return (
       command.includes("/huddle/hook.sh") ||
-      /passforth\.(py|mjs)\b.* hook /.test(command)
+      /passforth\.(py|mjs)\b.* hook /.test(`${line} `)
     );
   });
+}
+
+// The six hooks connect writes into a Claude Code account, as [event, group]. On Windows each is in exec form, which
+// Claude Code spawns with no shell (Git Bash is optional there); elsewhere it's the one line every Claude Code reads.
+export function hookEntries() {
+  const entry = (event, extra) =>
+    WINDOWS
+      ? {
+          type: "command",
+          command: runner(),
+          args: [path("passforth.mjs"), "hook", event],
+          ...extra,
+        }
+      : { type: "command", command: hookCommand(event), ...extra };
+  return [
+    ["SessionStart", { hooks: [entry("SessionStart", { timeout: 10 })] }],
+    [
+      "UserPromptSubmit",
+      { hooks: [entry("UserPromptSubmit", { timeout: 10 })] },
+    ],
+    [
+      "PostToolUse",
+      { matcher: "*", hooks: [entry("PostToolUse", { timeout: 10 })] },
+    ],
+    [
+      "PreToolUse",
+      {
+        matcher: "mcp__passforth__(open|send|reply)",
+        hooks: [entry("PreToolUse", { timeout: 20 })],
+      },
+    ],
+    [
+      "Stop",
+      {
+        hooks: [
+          entry("Stop", {
+            timeout: WAIT_TOTAL_S + 60,
+            async: true,
+            asyncRewake: true,
+          }),
+        ],
+      },
+    ],
+    ["SessionEnd", { hooks: [entry("SessionEnd", { timeout: 5 })] }],
+  ];
 }
 
 function pluginEnabled(settings) {
@@ -3709,37 +4148,10 @@ export function configure(directory, addHooks) {
   for (const name of ["PASSFORTH_SECRET", "PASSFORTH_URL", "PASSFORTH_ACCOUNT"])
     delete env[name];
   if (add) {
-    const entry = (event, extra) => ({
-      type: "command",
-      command: hookCommand(event),
-      ...extra,
-    });
-    const append = (event, group) => {
+    for (const [event, group] of hookEntries()) {
       hooks[event] ??= [];
       hooks[event].push(group);
-    };
-    append("SessionStart", { hooks: [entry("SessionStart", { timeout: 10 })] });
-    append("UserPromptSubmit", {
-      hooks: [entry("UserPromptSubmit", { timeout: 10 })],
-    });
-    append("PostToolUse", {
-      matcher: "*",
-      hooks: [entry("PostToolUse", { timeout: 10 })],
-    });
-    append("PreToolUse", {
-      matcher: "mcp__passforth__(open|send|reply)",
-      hooks: [entry("PreToolUse", { timeout: 20 })],
-    });
-    append("Stop", {
-      hooks: [
-        entry("Stop", {
-          timeout: WAIT_TOTAL_S + 60,
-          async: true,
-          asyncRewake: true,
-        }),
-      ],
-    });
-    append("SessionEnd", { hooks: [entry("SessionEnd", { timeout: 5 })] });
+    }
     env.PASSFORTH_ACCOUNT = accountLabel(directory);
   }
   for (const [name, value] of [
@@ -3753,40 +4165,64 @@ export function configure(directory, addHooks) {
   saveWithBackup(settingsPath, `${dumps(settings, { indent: 2 })}\n`);
   // The legacy curl hook and its folder, from before end-to-end encryption.
   removeTree(pjoin(directory, "huddle"));
-  const claude = which("claude");
-  const server = [runner(), path("passforth.mjs"), "mcp"];
+  const claude = claudeCommand();
   if (!claude) {
-    if (add) {
-      eprint(
-        `  add the MCP server yourself: CLAUDE_CONFIG_DIR=${directory} claude mcp add -s user passforth ` +
-          `-e PASSFORTH_ACCOUNT=${accountLabel(directory)} -- ${server.join(" ")}`,
-      );
-    }
+    if (add) MCP_BY_HAND.push(directory);
     return add;
   }
+  const server = [runner(), path("passforth.mjs"), "mcp"];
   const envVars = { ...process.env, CLAUDE_CONFIG_DIR: directory };
-  spawnSync(claude, ["mcp", "remove", "passforth", "-s", "user"], {
-    env: envVars,
-    stdio: "ignore",
-  });
+  runClaude(claude, ["mcp", "remove", "passforth", "-s", "user"], envVars);
   if (add) {
-    spawnSync(
+    // The name before -e, which takes every value up to the next option: after it, the name was taken for one.
+    const added = runClaude(
       claude,
       [
         "mcp",
         "add",
         "-s",
         "user",
+        "passforth",
         "-e",
         `PASSFORTH_ACCOUNT=${accountLabel(directory)}`,
-        "passforth",
         "--",
         ...server,
       ],
-      { env: envVars, stdio: "ignore" },
+      envVars,
     );
+    if (added.status !== 0) MCP_BY_HAND.push(directory);
   }
   return add;
+}
+
+// Claude Code on Windows: the native installer's claude.exe, else a claude.exe on PATH, else npm's claude.cmd.
+function windowsClaude() {
+  const native = pjoin(
+    process.env.USERPROFILE || homedir(),
+    ".local",
+    "bin",
+    "claude.exe",
+  );
+  return isFile(native) ? native : (which("claude.exe") ?? which("claude.cmd"));
+}
+
+const claudeCommand = () => (WINDOWS ? windowsClaude() : which("claude"));
+
+// A .cmd or .bat runs only through cmd.exe, which Node won't do itself: every argument quoted, and the whole line quoted
+// once more, since /s takes the first and last quote off it (as Node's own shell option does).
+function viaCmd(program, args) {
+  if (!WINDOWS || !/\.(cmd|bat)$/i.test(program)) return [program, args, {}];
+  const line = [program, ...args].map((arg) => `"${arg}"`).join(" ");
+  return [
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/s", "/c", `"${line}"`],
+    { windowsVerbatimArguments: true },
+  ];
+}
+
+function runClaude(claude, args, env) {
+  const [program, argv, options] = viaCmd(claude, args);
+  return spawnSync(program, argv, { env, stdio: "ignore", ...options });
 }
 
 function saveWithBackup(target, content) {
@@ -3797,7 +4233,7 @@ function saveWithBackup(target, content) {
     writeFileSync(`${real}.before-passforth`, readText(real), { mode: 0o600 });
   const tmp = `${real}.passforth-tmp`;
   writeFileSync(tmp, content, { mode: 0o600 });
-  renameSync(tmp, real);
+  replaceFile(tmp, real);
 }
 
 // Codex (ADR-0014): one home per account, $CODEX_HOME or ~/.codex, each with its config.toml and hooks.json. Passforth
@@ -3819,7 +4255,8 @@ function codexHomes() {
     pjoin(homedir(), ".codex"),
   ]) {
     const full = candidate ? resolve(expanduser(candidate)) : "";
-    if (full && isDir(full) && !found.includes(full)) found.push(full);
+    if (full && isDir(full) && !found.some((other) => samePath(other, full)))
+      found.push(full);
   }
   return found;
 }
@@ -3870,6 +4307,13 @@ function tomlParses(text) {
 }
 
 export function configureCodex(home, add) {
+  if (WINDOWS && add) {
+    // Codex's hooks here are POSIX lines with env prefixes; on Windows it gets Passforth through WSL (ADR-0017).
+    eprint(
+      "passforth: Codex on Windows isn't supported yet; run Passforth inside WSL for Codex.",
+    );
+    return false;
+  }
   const hooksPath = pjoin(home, "hooks.json");
   const configPath = pjoin(home, "config.toml");
   let current;
@@ -3975,30 +4419,100 @@ async function deviceCollect(url, deviceCode) {
   return answer;
 }
 
-async function linkByCode(url) {
-  // The terminal's way: show the code, wait while its developer approves it, take the new machine's secret.
-  const grant = await deviceStart(url);
-  print(
-    `To link this machine, open ${grant.verificationUri} and type the code ${grant.userCode}.`,
+async function linkByCode(url, terminal) {
+  // The code waits in device.json (shared with /passforth:login), so a run that stops for its developer's approval
+  // carries on with the same code next time. A terminal's run waits for the approval at once; an agent's run stops
+  // first, so the agent can tell its developer, and its next run waits.
+  let pending = readJson("device.json");
+  const fresh = !(
+    truthy(pending) && Number(pending.expiresAt ?? 0) > now() + 30
   );
-  print(
-    `It runs out in ${Math.floor(pyInt(grant.expiresIn) / 60)} minutes. Waiting…`,
-  );
-  const deadline = now() + pyInt(grant.expiresIn) + 60;
-  while (now() < deadline) {
-    await sleep(Math.max(1, pyInt(orElse(grant.interval, 5))) * 1000);
-    let answer;
-    try {
-      answer = await deviceCollect(url, grant.deviceCode);
-    } catch (error) {
-      if (!(error instanceof RelayError)) throw error;
-      if (error.status === 0) continue;
-      throw new SystemExit(`passforth: ${error.message}`);
-    }
-    if (answer.status === "approved") return str(answer.secret);
+  if (fresh) {
+    const grant = await deviceStart(url);
+    pending = {
+      deviceCode: grant.deviceCode,
+      userCode: grant.userCode,
+      uri: grant.verificationUri,
+      expiresAt: now() + pyInt(grant.expiresIn),
+      interval: pyInt(orElse(grant.interval, 5)),
+    };
+    writeJson("device.json", pending);
   }
-  throw new SystemExit(
-    "passforth: the code ran out before it was approved; run connect again.",
+  const page = `${pending.uri}?code=${pending.userCode}`;
+  say(`${paint("Open", "2")}  ${paint(page, "1")}`);
+  say(`${paint("Code", "2")}  ${paint(str(pending.userCode), "1")}`);
+  if (fresh && openBrowser(page)) say(paint("Opened it in your browser.", "2"));
+  if (fresh && !terminal) {
+    throw new NotFinished(
+      "ask the user to approve this machine at that page, signing in if asked, then run the same command again.",
+    );
+  }
+  return waitForApproval(url, pending, page, terminal);
+}
+
+async function waitForApproval(url, pending, page, terminal) {
+  // A terminal waits the code's whole life, a spinner turning; an agent's run waits AGENT_WAIT_S, then stops again.
+  // Each wait between frames and each poll is awaited, so a Ctrl+C is heard mid-spin, and the cursor comes back first.
+  const expires = Number(pending.expiresAt);
+  const deadline = terminal ? expires : Math.min(expires, now() + AGENT_WAIT_S);
+  const interval = Math.max(1, pyInt(orElse(pending.interval, 5)));
+  const who = terminal ? "you" : "the user";
+  const spinning = styled();
+  const frames = drawsUnicode() ? SPIN : "|/-\\";
+  const interrupted = () =>
+    process.stdout.write("\r\x1b[2K\x1b[?25h", () => process.exit(130));
+  if (!spinning) say(`Waiting for ${who} to approve it…`);
+  let polled = 0;
+  let turn = 0;
+  try {
+    if (spinning) {
+      process.on("SIGINT", interrupted);
+      out("\x1b[?25l");
+    }
+    while (now() < deadline) {
+      if (spinning) {
+        const left = Math.max(0, Math.trunc(expires - now()));
+        const time = `· ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} left`;
+        out(
+          `\r\x1b[2K${indent}${paint(frames[turn % frames.length], "32")} Waiting for ${who} to approve it ${paint(time, "2")}`,
+        );
+        turn += 1;
+      }
+      if (now() - polled >= interval) {
+        polled = now();
+        let answer;
+        try {
+          answer = await deviceCollect(url, str(pending.deviceCode));
+        } catch (error) {
+          if (!(error instanceof RelayError)) throw error;
+          if (error.status !== 0) {
+            // Denied, expired or used: the code is dead, so the next run starts a new one.
+            remove(path("device.json"));
+            throw new SystemExit(`passforth: ${error.message}`);
+          }
+          answer = {};
+        }
+        if (get(answer, "status") === "approved") {
+          unlinkSync(path("device.json"));
+          return str(answer.secret);
+        }
+      }
+      await sleep(spinning ? 80 : 500);
+    }
+  } finally {
+    if (spinning) {
+      process.removeListener("SIGINT", interrupted);
+      out("\r\x1b[2K\x1b[?25h");
+    }
+  }
+  if (now() >= expires) {
+    remove(path("device.json"));
+    throw new SystemExit(
+      "passforth: the code ran out before it was approved; run connect again.",
+    );
+  }
+  throw new NotFinished(
+    `the user hasn't approved it yet. Ask them to open ${page}, then run the same command again.`,
   );
 }
 
@@ -4022,7 +4536,7 @@ async function logoutNow() {
   for (const name of ["secret", "key.json", "device.json"]) remove(path(name));
   return (
     "Logged out: this machine's secret is revoked, and its key is gone from it. /passforth:login, or " +
-    `${RUNTIME} ${HERE} login in a terminal, links it again.`
+    `${hereCommand("login")} in a terminal, links it again.`
   );
 }
 
@@ -4044,6 +4558,12 @@ function commandArchive(argv) {
 
 export function terminalYes(question) {
   // A yes typed at this terminal, never read from stdin, which may be the message itself. No terminal: no.
+  if (WINDOWS) {
+    if (!process.stdin.isTTY) return false;
+    return consoleLine(question).then((answer) =>
+      ["y", "yes"].includes(strip(answer).toLowerCase()),
+    );
+  }
   let tty;
   try {
     tty = openSync("/dev/tty", "r+");
@@ -4187,9 +4707,10 @@ async function commandSend(argv) {
   const opts = parseSend(argv);
   if (!opts.text.length && isatty(0))
     throw sendError("give the message as TEXT, or pipe it in");
+  const piped = opts.text.length ? "" : await readStdin();
   const text = opts.text.length
     ? opts.text.join(" ")
-    : (await readStdin()).replace(/\n+$/, "");
+    : (WINDOWS ? piped.replace(/\r\n?/g, "\n") : piped).replace(/\n+$/, "");
   const args = {
     to: opts.to,
     kind: opts.kind,
@@ -4210,9 +4731,9 @@ async function commandSend(argv) {
     if (to !== null && !opts.yes) {
       const listing = fileListing(picked);
       if (
-        !terminalYes(
+        !(await terminalYes(
           `Send ${filesLine(picked)} to ${to}, sealed end to end? ${listing} [y/N] `,
-        )
+        ))
       ) {
         throw new RelayError(
           0,
@@ -4245,9 +4766,9 @@ function commandShareBranch(argv) {
 function install() {
   // npx, bunx and their kind run this file from a cache that comes and goes: the hooks run a copy that stays.
   const target = path("passforth.mjs");
-  if (realpath(target) !== THIS)
+  if (!samePath(realpath(target), THIS))
     writePrivate("passforth.mjs", readFileSync(THIS));
-  HERE = shq(target);
+  HERE = quoteHere(target);
 }
 
 async function commandConnect(argv) {
@@ -4272,101 +4793,181 @@ async function commandConnect(argv) {
   ) {
     throw new SystemExit("passforth: connect needs --url https://…");
   }
-  print(`passforth ${VERSION} · client sha256 ${clientDigest()}`);
-  let token = argv.includes("--code")
-    ? ""
-    : strip(
-        getpass(
-          "Paste this machine's secret from the Passforth dashboard, or press Enter to link it with a code instead " +
-            "(it won't show): ",
-        ),
-      );
-  if (!token) token = await linkByCode(url);
-  if (!token.startsWith("hk_live_")) {
-    throw new SystemExit(
-      "passforth: that isn't a machine secret; make one on the dashboard's Machines page.",
+  const terminal = hasTerminal();
+  header("connect this machine");
+  step(1, "Link this machine");
+  let [token, me] = await linkedAlready(url);
+  if (truthy(me)) {
+    say(
+      `Already linked as ${paint(`@${me.handle}`, "1")} (${me.machineLabel})`,
+      "ok",
     );
+  } else {
+    token =
+      argv.includes("--code") || !terminal
+        ? ""
+        : strip(
+            await getpass(
+              `${indent}Paste this machine's secret, or press Enter for a code (it won't show): `,
+            ),
+          );
+    if (!token) token = await linkByCode(url, terminal);
+    if (!token.startsWith("hk_live_")) {
+      throw new SystemExit(
+        "passforth: that isn't a machine secret; make one on the dashboard's Machines page.",
+      );
+    }
+    // Kept the moment it arrives: a code's secret is handed over once, so a run that stops after the approval (a
+    // slow /me, say) carries on with this link next time instead of asking for another.
+    writePrivate("secret", `${token}\n`);
+    writeJson("config.json", { url, accounts: [] });
+    [, me] = await relay("GET", "me", { token, url });
+    writeJson("config.json", {
+      url,
+      userId: me.userId,
+      handle: me.handle,
+      accounts: [],
+    });
+    say(`Linked as ${paint(`@${me.handle}`, "1")} (${me.machineLabel})`, "ok");
   }
-  const [, me] = await relay("GET", "me", { token, url });
-  print(`Connecting this machine as @${me.handle} (${me.machineLabel}).`);
-  writePrivate("secret", `${token}\n`);
-  writeJson("config.json", {
-    url,
-    userId: me.userId,
-    handle: me.handle,
-    accounts: [],
-  });
   install();
-  await unlockOrCreate(token, url, me);
+  const stored = await storedKey(token, url);
+  step(2, stored ? "Unlock your key" : "Choose your passphrase");
+  const unlocked = await unlockOrCreate(token, url, me, terminal, stored);
+  step(3, "Connect your AI tools");
   const accounts = [];
   for (const directory of claudeDirs()) {
     if (configure(directory, true)) {
       accounts.push(directory);
-      print(
-        `  connected Claude Code at ${directory} (account "${accountLabel(directory)}")`,
+      say(
+        `${toolLine("Claude Code", directory)} (${accountLabel(directory)})`,
+        "ok",
       );
+      if (MCP_BY_HAND.includes(directory)) say(mcpHint(directory), "note");
     } else {
-      print(
-        `  Claude Code at ${directory} runs Passforth from its plugin, which brings the hooks and the server`,
+      say(
+        `${toolLine("Claude Code", directory)} (${accountLabel(directory)}), through its Passforth plugin`,
+        "ok",
       );
     }
   }
   const homes = codexHomes().filter((home) => configureCodex(home, true));
   for (const home of homes)
-    print(`  connected Codex at ${home} (account "${codexLabel(home)}")`);
+    say(`${toolLine("Codex", home)} (${codexLabel(home)})`, "ok");
   const cfg = config();
   cfg.accounts = accounts;
   cfg.codexHomes = homes;
   writeJson("config.json", cfg);
-  const key = ownKey();
-  print(`Your key's fingerprint: ${fingerprint(key.publicBytes)}`);
   if (homes.length)
-    print(
+    say(
       "In Codex, open /hooks once and trust Passforth's hooks: Codex runs them only after that.",
+      "note",
     );
-  print(
-    "Start or restart Claude Code or Codex in a trusted folder to join. To remove Passforth from this machine:",
+  if (!unlocked) {
+    finish(
+      "Connected, but the key is still locked: run the unlock command above in a terminal on this machine, " +
+        "then restart Claude Code or Codex.",
+      "note",
+    );
+    return NOT_FINISHED;
+  }
+  finish(
+    `Connected. ${terminal ? "Restart Claude Code or Codex to join." : "Ask the user to restart Claude Code or Codex to join."}`,
   );
-  print(`  ${RUNTIME} ${HERE} disconnect`);
+  say(paint(`Remove it: ${hereCommand("disconnect")}`, "2"));
   return 0;
 }
 
-async function unlockOrCreate(token, url, me) {
+async function linkedAlready(url) {
+  // A machine this relay already knows keeps its link, so connect runs again (an agent's next run, or after an
+  // update) without linking a second machine.
+  if (config().url !== url || !exists(path("secret"))) return ["", null];
+  let me;
+  try {
+    [, me] = await relay("GET", "me", { timeout: 10 });
+  } catch (error) {
+    if (error instanceof RelayError && error.status === 401) return ["", null];
+    throw error;
+  }
+  return [secret(), me];
+}
+
+async function storedKey(token, url) {
   let stored;
   try {
     [, stored] = await relay("GET", "keys/me", { token, url });
   } catch (error) {
     if (!(error instanceof RelayError) || error.status !== 404) throw error;
-    stored = null;
+    return null;
   }
-  if (truthy(stored)) {
-    for (let i = 0; i < 3; i++) {
-      const passphrase = getpass("Your Passforth passphrase: ");
-      let privateRaw;
-      try {
-        privateRaw = unwrapPrivate(stored.wrap, passphrase, me.userId);
-      } catch (error) {
-        if (!valueish(error)) throw error;
-        eprint("That passphrase doesn't open your key. Try again.");
-        continue;
-      }
-      if (b64(x25519Public(privateRaw)) !== stored.publicKey) {
-        throw new SystemExit(
-          "passforth: the stored key doesn't match its public half; contact support.",
-        );
-      }
-      saveKey(me, pyInt(stored.version), privateRaw);
-      return;
-    }
-    throw new SystemExit(
-      `passforth: forgot it? ${RUNTIME} ${HERE} reset-key makes a new one.`,
+  return truthy(stored) ? stored : null;
+}
+
+async function unlockOrCreate(token, url, me, terminal, stored) {
+  // True once the key is on this machine. False when there's neither a terminal nor a screen to ask on: its developer
+  // runs unlock in a terminal later.
+  const key = ownKey();
+  if (
+    stored &&
+    key &&
+    key.userId === me.userId &&
+    key.public === stored.publicKey
+  ) {
+    say(
+      `Your key is already on this machine · ${fingerprint(key.publicBytes)}`,
+      "ok",
     );
+    return true;
   }
-  print(
-    "Choose a Passforth passphrase. It locks your key: Passforth never sees it and can't recover it.",
-  );
-  const privateRaw = randomBytes(32);
-  const passphrase = newPassphrase();
+  if (!stored)
+    say("It locks your key. Passforth never sees it and can't recover it.");
+  if (!terminal)
+    say(
+      "Asking the user in a window on their screen: the passphrase never passes through here.",
+    );
+  let privateRaw;
+  let passphrase;
+  try {
+    if (stored) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const typed = await askPassphrase(
+          "Your Passforth passphrase: ",
+          `${attempt ? "That passphrase doesn't open your key. " : ""}Type your Passforth passphrase to unlock your key ` +
+            "on this machine.",
+          terminal,
+        );
+        let opened;
+        try {
+          opened = unwrapPrivate(stored.wrap, typed, me.userId);
+        } catch (error) {
+          if (!valueish(error)) throw error;
+          say("That passphrase doesn't open your key. Try again.", "note");
+          continue;
+        }
+        if (b64(x25519Public(opened)) !== stored.publicKey) {
+          throw new SystemExit(
+            "passforth: the stored key doesn't match its public half; contact support.",
+          );
+        }
+        saveKey(me, pyInt(stored.version), opened);
+        say(`Key unlocked · ${fingerprint(x25519Public(opened))}`, "ok");
+        return true;
+      }
+      throw new SystemExit(
+        `passforth: forgot it? ${hereCommand("reset-key")} makes a new one.`,
+      );
+    }
+    privateRaw = randomBytes(32);
+    passphrase = await newPassphrase(terminal);
+  } catch (error) {
+    if (!(error instanceof NoScreen)) throw error;
+    say(
+      "No screen here to ask for the passphrase. Run this in a terminal on this machine:",
+      "note",
+    );
+    say(`  ${hereCommand("unlock")}`);
+    return false;
+  }
   const [, saved] = await relay("PUT", "keys/me", {
     body: {
       publicKey: b64(x25519Public(privateRaw)),
@@ -4377,17 +4978,30 @@ async function unlockOrCreate(token, url, me) {
     url,
   });
   saveKey(me, pyInt(saved.version), privateRaw);
+  say(`Key locked · ${fingerprint(x25519Public(privateRaw))}`, "ok");
+  return true;
 }
 
-function newPassphrase() {
+async function newPassphrase(terminal) {
+  let warning = "";
   for (;;) {
-    const first = getpass("New passphrase (12 characters or more): ");
-    if (cpLen(first) < 12) {
-      eprint("Use 12 characters or more.");
-      continue;
-    }
-    if (getpass("Again: ") === first) return first;
-    eprint("They didn't match.");
+    const first = await askPassphrase(
+      "Passphrase (12 characters or more): ",
+      `${warning}Choose a Passforth passphrase of 12 characters or more. It locks your key: Passforth never sees ` +
+        "it and can't recover it.",
+      terminal,
+    );
+    if (cpLen(first) < 12) warning = "Use 12 characters or more. ";
+    else if (
+      (await askPassphrase(
+        "Again: ",
+        "Type the same passphrase again.",
+        terminal,
+      )) === first
+    )
+      return first;
+    else warning = "They didn't match. ";
+    say(strip(warning), "note");
   }
 }
 
@@ -4402,20 +5016,32 @@ function saveKey(me, version, privateRaw) {
 }
 
 async function commandUnlock() {
+  header("unlock your key");
   const [, me] = await relay("GET", "me");
-  await unlockOrCreate(secret(), config().url, me);
-  print(`Unlocked. Fingerprint: ${fingerprint(ownKey().publicBytes)}`);
-  return 0;
+  const token = secret();
+  const url = config().url;
+  return (await unlockOrCreate(
+    token,
+    url,
+    me,
+    hasTerminal(),
+    await storedKey(token, url),
+  ))
+    ? 0
+    : NOT_FINISHED;
 }
 
 async function commandResetKey() {
-  print(
-    "This makes a new key. Messages sealed to your old one can't be opened again; your contacts are told your key changed.",
+  header("make a new key");
+  say(
+    "This makes a new key. Messages sealed to your old one can't be opened again; your contacts are told your key " +
+      "changed.",
+    "note",
   );
-  if (ttyInput("Type reset to go on: ") !== "reset") return 1;
+  if ((await ttyInput(`${indent}Type reset to go on: `)) !== "reset") return 1;
   const [, me] = await relay("GET", "me");
   const privateRaw = randomBytes(32);
-  const passphrase = newPassphrase();
+  const passphrase = await newPassphrase(true);
   const [, saved] = await relay("PUT", "keys/me", {
     body: {
       publicKey: b64(x25519Public(privateRaw)),
@@ -4424,8 +5050,9 @@ async function commandResetKey() {
     },
   });
   saveKey(me, pyInt(saved.version), privateRaw);
-  print(
-    `New key. Fingerprint: ${fingerprint(x25519Public(privateRaw))}. Run unlock on your other machines.`,
+  say(
+    `New key · ${fingerprint(x25519Public(privateRaw))}. Run unlock on your other machines.`,
+    "ok",
   );
   return 0;
 }
@@ -4433,11 +5060,16 @@ async function commandResetKey() {
 async function commandTrust(argv) {
   if (!argv.length) throw new SystemExit("passforth: trust @handle");
   const handle = argv[0].replace(/^@+/, "").toLowerCase();
+  header("trust a key");
   const [, found] = await relay("GET", `keys/${quote(handle)}`);
   const publicRaw = unb64(found.publicKey, 32);
-  print(`@${handle}'s key fingerprint: ${fingerprint(publicRaw)}`);
-  print("Check it with them over a channel you trust before you accept it.");
-  if (ttyInput("Trust this key? Type yes: ") !== "yes") return 1;
+  say(`@${handle}'s key fingerprint: ${paint(fingerprint(publicRaw), "1")}`);
+  say(
+    "Check it with them over a channel you trust before you accept it.",
+    "note",
+  );
+  if ((await ttyInput(`${indent}Trust this key? Type yes: `)) !== "yes")
+    return 1;
   const peers = orDict(readJson("peers.json", {}));
   peers[found.userId] = {
     handle: found.handle,
@@ -4445,34 +5077,37 @@ async function commandTrust(argv) {
     public: found.publicKey,
   };
   writeJson("peers.json", peers);
-  print("Trusted.");
+  say("Trusted.", "ok");
   return 0;
 }
 
 async function commandDisconnect() {
+  header("disconnect this machine");
   try {
     await relay("POST", "machine/revoke", { body: {} });
-    print("This machine's secret is revoked.");
+    say("This machine's secret is revoked.", "ok");
   } catch (error) {
     if (!(error instanceof RelayError)) throw error;
-    eprint(
-      `passforth: couldn't revoke the secret (${error.message}); revoke it on the dashboard's Machines page.`,
+    say(
+      `Couldn't revoke the secret (${error.message}); revoke it on the dashboard's Machines page.`,
+      "note",
     );
   }
   const accounts = config().accounts;
   for (const directory of truthy(accounts) ? accounts : claudeDirs()) {
     configure(directory, false);
-    print(`  removed Passforth from ${directory}`);
+    say(`Removed from Claude Code at ${tilde(directory)}`, "ok");
   }
   const homes = config().codexHomes;
   for (const home of truthy(homes) ? homes : codexHomes()) {
-    if (configureCodex(home, false)) print(`  removed Passforth from ${home}`);
+    if (configureCodex(home, false))
+      say(`Removed from Codex at ${tilde(home)}`, "ok");
   }
   for (const name of ["secret", "key.json", "peers.json", "config.json"])
     remove(path(name));
   removeTree(path("state"));
-  print(
-    "Passforth is removed from this machine. The previous settings are in settings.json.before-passforth.",
+  finish(
+    "Passforth is removed from this machine. Your previous settings are in settings.json.before-passforth.",
   );
   return 0;
 }
@@ -4480,15 +5115,23 @@ async function commandDisconnect() {
 function commandStatus() {
   const cfg = config();
   const key = ownKey();
-  print(`passforth ${VERSION} · client sha256 ${clientDigest()}`);
-  print(
-    `relay: ${str(get(cfg, "url", "not connected"))} · you: @${str(get(cfg, "handle", "?"))}`,
-  );
-  print(`key fingerprint: ${key ? fingerprint(key.publicBytes) : "no key"}`);
+  header("status");
+  const rows = [
+    ["You", truthy(cfg.handle) ? `@${cfg.handle}` : "not connected"],
+    ["Relay", orElse(cfg.url, "not connected")],
+    [
+      "Key",
+      key
+        ? fingerprint(key.publicBytes)
+        : `none on this machine yet: ${hereCommand("unlock")}`,
+    ],
+  ];
   for (const directory of orElse(cfg.accounts, []))
-    print(`  Claude Code account: ${directory}`);
+    rows.push(["Claude Code", tilde(directory)]);
   for (const home of orElse(cfg.codexHomes, []))
-    print(`  Codex account: ${home}`);
+    rows.push(["Codex", tilde(home)]);
+  for (const [label, value] of rows)
+    say(`${paint(label.padEnd(11), "2")}  ${value}`);
   return 0;
 }
 
@@ -4508,7 +5151,8 @@ const COMMANDS = {
   connect: commandConnect,
   login: (argv) => commandConnect([...argv, "--code"]),
   logout: async () => {
-    print(await logoutNow());
+    header("log out");
+    say(await logoutNow(), "ok");
     return 0;
   },
   archive: commandArchive,
@@ -4538,9 +5182,20 @@ export async function main(argv) {
   try {
     return await command(argv.slice(1));
   } catch (error) {
-    if (!(error instanceof RelayError)) throw error;
-    eprint(`passforth: ${error.message}`);
-    return 1;
+    if (error instanceof NotFinished) {
+      say(`Not finished: ${error.message}`, "note");
+      return NOT_FINISHED;
+    }
+    if (error instanceof RelayError) {
+      fail(error.message);
+      return 1;
+    }
+    // A SystemExit with text is one failure line; SystemExit(2), as argparse leaves, goes on out quietly.
+    if (error instanceof SystemExit && error.message) {
+      fail(error.message.replace(/^passforth: /, ""));
+      return 1;
+    }
+    throw error;
   }
 }
 
@@ -4555,7 +5210,7 @@ function leave(code) {
 
 function isEntry() {
   try {
-    return realpathSync(process.argv[1]) === THIS;
+    return samePath(realpathSync(process.argv[1]), THIS);
   } catch {
     return false;
   }

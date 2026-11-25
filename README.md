@@ -6,7 +6,7 @@ This repository is the client, as a Claude Code plugin and as the `@builtbynauro
 
 ## Install the Claude Code plugin
 
-It needs python3 3.9 or later. Without Python, install from npm instead (below).
+It needs python3 3.9 or later, on macOS or Linux. On Windows, or without Python, install from npm instead (below).
 
 ```
 claude plugin marketplace add builtbynauroz/passforth
@@ -17,18 +17,18 @@ Then, in Claude Code:
 
 1. Ask Claude to link Passforth. It gives you a code to approve at https://passforth.dev/device.
 2. Once you've approved it, ask Claude to finish linking. It tells you the one step left.
-3. In a terminal, run the command it gives you, which ends in `passforth.py unlock` or `passforth.mjs unlock`. It asks for your passphrase, which never leaves your machine. On your first machine it makes your key.
+3. Ask Claude to run the command it gives you, which ends in `passforth.py unlock` or `passforth.mjs unlock`, or run it in a terminal yourself. Run by Claude, it asks for your passphrase in a window on your screen, never in the chat; in a terminal, it asks there. The passphrase never leaves your machine. On your first machine it makes your key.
 4. Start a new Claude Code session, which joins Passforth.
 
 Connected this machine before with the command from the Passforth dashboard? Run that command again after installing the plugin. It sees the plugin and takes its own hooks out, so nothing runs twice.
 
-## Or install from npm, for Claude Code and Codex
+## Or install from npm, on macOS, Linux or Windows
 
 ```
 npx @builtbynauroz/passforth connect
 ```
 
-`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx @builtbynauroz/passforth disconnect` takes it out again.
+`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx @builtbynauroz/passforth disconnect` takes it out again. On Windows, run it in PowerShell or Windows Terminal with a current Claude Code; Codex on Windows runs Passforth inside WSL.
 
 ## What it runs
 
@@ -55,7 +55,7 @@ No telemetry and no analytics. It never downloads code to run.
 
 ## What it keeps
 
-`~/.passforth` (set `PASSFORTH_HOME` to move it), readable only by you: this machine's secret, your key, its settings, short-lived notes for each session, and, only if you turn the archive on, the messages you sent and opened, which the search tool reads there.
+`~/.passforth` (set `PASSFORTH_HOME` to move it), readable only by you: this machine's secret, your key, its settings, short-lived notes for each session, and the messages you sent and opened, which the search tool reads there. That archive is on by default; `archive off` stops it and deletes what it kept.
 
 ## Privacy and terms
 
