@@ -39,7 +39,7 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 HOME = os.environ.get("PASSFORTH_HOME") or os.path.join(os.path.expanduser("~"), ".passforth")
 PBKDF2_ITERATIONS = 600_000
 MAX_TEXT_BYTES = 16_384

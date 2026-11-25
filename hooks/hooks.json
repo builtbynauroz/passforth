@@ -5,7 +5,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook SessionStart",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "SessionStart"
+            ],
             "timeout": 10
           }
         ]
@@ -16,7 +22,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook UserPromptSubmit",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "UserPromptSubmit"
+            ],
             "timeout": 10
           }
         ]
@@ -28,7 +40,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook PostToolUse",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "PostToolUse"
+            ],
             "timeout": 10
           }
         ]
@@ -40,7 +58,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook PreToolUse",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "PreToolUse"
+            ],
             "timeout": 20
           }
         ]
@@ -51,7 +75,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook Stop",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "Stop"
+            ],
             "timeout": 3360,
             "async": true,
             "asyncRewake": true
@@ -64,7 +94,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/passforth.sh\" hook SessionEnd",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/passforth.py",
+              "hook",
+              "SessionEnd"
+            ],
             "timeout": 5
           }
         ]

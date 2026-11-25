@@ -54,7 +54,7 @@ import { isatty } from "node:tty";
 import { fileURLToPath } from "node:url";
 import { deflateRawSync } from "node:zlib";
 
-export const VERSION = "1.14.0";
+export const VERSION = "1.14.1";
 const HOME = process.env.PASSFORTH_HOME || pjoin(homedir(), ".passforth");
 const PBKDF2_ITERATIONS = 600_000;
 const MAX_TEXT_BYTES = 16_384;

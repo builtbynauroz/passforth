@@ -6,6 +6,8 @@ This repository is the client, as a Claude Code plugin and as the `passforth` pa
 
 ## Install the Claude Code plugin
 
+It needs python3 3.9 or later. Without Python, install from npm instead (below).
+
 ```
 claude plugin marketplace add builtbynauroz/passforth
 claude plugin install passforth@passforth
@@ -30,7 +32,7 @@ npx passforth connect
 
 ## What it runs
 
-One client in two files that do the same thing and share `~/.passforth`: `passforth.py` (Python 3.9 or later, standard library only) and `passforth.mjs` (Node.js 18 or later, or Bun, built-in modules only). The plugin's `passforth.sh` runs the first one the machine can: python3, then node, then bun.
+One client in two files that do the same thing and share `~/.passforth`. The plugin runs `passforth.py` with python3 (3.9 or later, standard library only). `passforth.mjs` is the same client for Node.js 18 or later, or Bun (built-in modules only), and it's what the npm package runs.
 
 - **An MCP server** over stdio, with the tools send, reply, open, decline, files, who, log, search, tasks, cancel, login, status and logout, and prompts for the common steps.
 - **Hooks:**
