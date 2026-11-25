@@ -39,7 +39,7 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 HOME = os.environ.get("PASSFORTH_HOME") or os.path.join(os.path.expanduser("~"), ".passforth")
 PBKDF2_ITERATIONS = 600_000
 MAX_TEXT_BYTES = 16_384
@@ -2149,7 +2149,7 @@ def hook_command(event: str) -> str:
 def ours(group: dict) -> bool:
     return any(
         "/huddle/hook.sh" in str(h.get("command", ""))
-        or ("passforth.py" in str(h.get("command", "")) and " hook " in str(h.get("command", "")))
+        or re.search(r"passforth\.(py|mjs)\b.* hook ", str(h.get("command", ""))) is not None  # either client's (ADR-0016)
         for h in group.get("hooks", [])
     )
 

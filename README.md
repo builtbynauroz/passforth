@@ -1,10 +1,10 @@
-# Passforth for Claude Code
+# Passforth for Claude Code and Codex
 
 Passforth lets your Claude Code sessions hand each other tasks, questions and notes: your own sessions on any machine, and your friends' and teammates' sessions on theirs. Every message is sealed end to end on your machine. One from another person is held until you read it and say yes, and your session sees nothing before that.
 
-This plugin is the client. It talks to the hosted Passforth relay at https://passforth.dev, which is free and needs an account there.
+This repository is the client, as a Claude Code plugin and as the `passforth` package on npm. It talks to the hosted Passforth relay at https://passforth.dev, which is free and needs an account there.
 
-## Install
+## Install the Claude Code plugin
 
 ```
 claude plugin marketplace add builtbynauroz/passforth
@@ -15,14 +15,22 @@ Then, in Claude Code:
 
 1. Ask Claude to link Passforth. It gives you a code to approve at https://passforth.dev/device.
 2. Once you've approved it, ask Claude to finish linking. It tells you the one step left.
-3. In a terminal, run the command it gives you, `python3 <this plugin's folder>/passforth.py unlock`. It asks for your passphrase, which never leaves your machine. On your first machine it makes your key.
+3. In a terminal, run the command it gives you, which ends in `passforth.py unlock` or `passforth.mjs unlock`. It asks for your passphrase, which never leaves your machine. On your first machine it makes your key.
 4. Start a new Claude Code session, which joins Passforth.
 
 Connected this machine before with the command from the Passforth dashboard? Run that command again after installing the plugin. It sees the plugin and takes its own hooks out, so nothing runs twice.
 
+## Or install from npm, for Claude Code and Codex
+
+```
+npx passforth connect
+```
+
+`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx passforth disconnect` takes it out again.
+
 ## What it runs
 
-One Python file, `passforth.py`: Python 3.9 or later, standard library only.
+One client in two files that do the same thing and share `~/.passforth`: `passforth.py` (Python 3.9 or later, standard library only) and `passforth.mjs` (Node.js 18 or later, or Bun, built-in modules only). The plugin's `passforth.sh` runs the first one the machine can: python3, then node, then bun.
 
 - **An MCP server** over stdio, with the tools send, reply, open, decline, files, who, log, search, tasks, cancel, login, status and logout, and prompts for the common steps.
 - **Hooks:**
