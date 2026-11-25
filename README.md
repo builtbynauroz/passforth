@@ -4,6 +4,8 @@ Passforth lets your Claude Code sessions hand each other tasks, questions and no
 
 This repository is the client, as a Claude Code plugin and as the `@builtbynauroz/passforth` package on npm. It talks to the hosted Passforth relay at https://passforth.dev, which is free and needs an account there.
 
+**Docs:** https://passforth.dev/docs has the quick start for a Mac, Windows or Linux, every command, and what to do when something goes wrong. The quickest install is to let Claude Code or Codex do it: paste the prompt from https://passforth.dev/docs#with-your-ai into a session, and it runs the install and stops only for you to approve the machine in your browser and type your passphrase in a window, never in the chat.
+
 ## Install the Claude Code plugin
 
 It needs python3 3.9 or later, on macOS or Linux. On Windows, or without Python, install from npm instead (below).
@@ -28,7 +30,7 @@ Connected this machine before with the command from the Passforth dashboard? Run
 npx @builtbynauroz/passforth connect
 ```
 
-`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx @builtbynauroz/passforth disconnect` takes it out again. On Windows, run it in PowerShell or Windows Terminal with a current Claude Code; Codex on Windows runs Passforth inside WSL.
+`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine, in three numbered steps. Run by Claude Code or Codex, with no terminal, it asks for the passphrase in a window on your screen and tells the agent each next step. `npx @builtbynauroz/passforth disconnect` takes it out again. On Windows, run it in PowerShell or Windows Terminal with a current Claude Code; Codex on Windows runs Passforth inside WSL.
 
 ## What it runs
 

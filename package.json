@@ -17,11 +17,14 @@
   "keywords": [
     "claude-code",
     "codex",
+    "claude",
+    "ai-agents",
     "mcp",
     "handoff",
-    "end-to-end-encryption"
+    "end-to-end-encryption",
+    "cli"
   ],
-  "homepage": "https://passforth.dev",
+  "homepage": "https://passforth.dev/docs",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/builtbynauroz/passforth.git"
