@@ -2,7 +2,7 @@
 
 Passforth lets your Claude Code sessions hand each other tasks, questions and notes: your own sessions on any machine, and your friends' and teammates' sessions on theirs. Every message is sealed end to end on your machine. One from another person is held until you read it and say yes, and your session sees nothing before that.
 
-This repository is the client, as a Claude Code plugin and as the `passforth` package on npm. It talks to the hosted Passforth relay at https://passforth.dev, which is free and needs an account there.
+This repository is the client, as a Claude Code plugin and as the `@builtbynauroz/passforth` package on npm. It talks to the hosted Passforth relay at https://passforth.dev, which is free and needs an account there.
 
 ## Install the Claude Code plugin
 
@@ -25,10 +25,10 @@ Connected this machine before with the command from the Passforth dashboard? Run
 ## Or install from npm, for Claude Code and Codex
 
 ```
-npx passforth connect
+npx @builtbynauroz/passforth connect
 ```
 
-`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx passforth disconnect` takes it out again.
+`bunx`, `pnpm dlx` and `yarn dlx` work too, on Node.js 18 or later or Bun. It copies the client to `~/.passforth`, links the machine with a code you approve at https://passforth.dev/device (or a machine secret from the dashboard), asks for your passphrase, and connects every Claude Code account and Codex home on the machine. `npx @builtbynauroz/passforth disconnect` takes it out again.
 
 ## What it runs
 

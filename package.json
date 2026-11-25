@@ -1,5 +1,5 @@
 {
-  "name": "passforth",
+  "name": "@builtbynauroz/passforth",
   "version": "1.14.1",
   "description": "Hand tasks, questions and notes between Claude Code and Codex sessions, yours and your teammates', end to end encrypted and held until the developer receiving them says yes.",
   "type": "module",
